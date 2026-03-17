@@ -1,7 +1,7 @@
 'use client';
 
-import { useRef, useMemo } from 'react';
-import { Canvas, useFrame } from '@react-three/fiber';
+import { useRef, useMemo, Suspense } from 'react';
+import { Canvas, useFrame, useLoader } from '@react-three/fiber';
 import { Float, MeshTransmissionMaterial } from '@react-three/drei';
 import * as THREE from 'three';
 
@@ -47,78 +47,38 @@ function Particles({ count = 200 }) {
 }
 
 function GlassBody() {
-    const bodyRef = useRef<THREE.Group>(null);
+    const bodyRef = useRef<THREE.Mesh>(null);
+    const texture = useLoader(THREE.TextureLoader, '/anatomy.png');
 
     useFrame((state) => {
         if (bodyRef.current) {
             bodyRef.current.rotation.y = Math.sin(state.clock.getElapsedTime() * 0.3) * 0.15;
+            // Add a subtle breathing scale effect
+            const scale = 1 + Math.sin(state.clock.getElapsedTime() * 1.5) * 0.02;
+            bodyRef.current.scale.set(scale, scale, 1);
         }
     });
 
     return (
         <Float speed={1.5} rotationIntensity={0.2} floatIntensity={0.5}>
-            <group ref={bodyRef} position={[0, -0.5, 0]}>
-                {/* Head */}
-                <mesh position={[0, 2.2, 0]}>
-                    <sphereGeometry args={[0.35, 32, 32]} />
-                    <MeshTransmissionMaterial
-                        backside
-                        samples={6}
-                        resolution={512}
-                        transmission={0.95}
-                        roughness={0.1}
-                        thickness={0.5}
-                        ior={1.5}
-                        chromaticAberration={0.06}
-                        color="#38BDF8"
-                    />
-                </mesh>
-                {/* Torso */}
-                <mesh position={[0, 1.2, 0]}>
-                    <capsuleGeometry args={[0.45, 1.0, 16, 32]} />
-                    <MeshTransmissionMaterial
-                        backside
-                        samples={6}
-                        resolution={512}
-                        transmission={0.92}
-                        roughness={0.1}
-                        thickness={0.6}
-                        ior={1.5}
-                        chromaticAberration={0.04}
-                        color="#0EA5E9"
-                    />
-                </mesh>
-                {/* Heart glow */}
-                <mesh position={[0.15, 1.5, 0.2]}>
-                    <sphereGeometry args={[0.12, 16, 16]} />
-                    <meshStandardMaterial color="#EF4444" emissive="#EF4444" emissiveIntensity={2} transparent opacity={0.8} />
-                </mesh>
-                {/* Left Arm */}
-                <mesh position={[-0.7, 1.3, 0]} rotation={[0, 0, 0.3]}>
-                    <capsuleGeometry args={[0.12, 0.8, 8, 16]} />
-                    <MeshTransmissionMaterial backside samples={4} resolution={256} transmission={0.9} roughness={0.15} thickness={0.3} ior={1.4} color="#38BDF8" />
-                </mesh>
-                {/* Right Arm */}
-                <mesh position={[0.7, 1.3, 0]} rotation={[0, 0, -0.3]}>
-                    <capsuleGeometry args={[0.12, 0.8, 8, 16]} />
-                    <MeshTransmissionMaterial backside samples={4} resolution={256} transmission={0.9} roughness={0.15} thickness={0.3} ior={1.4} color="#38BDF8" />
-                </mesh>
-                {/* Left Leg */}
-                <mesh position={[-0.25, -0.15, 0]}>
-                    <capsuleGeometry args={[0.15, 1.0, 8, 16]} />
-                    <MeshTransmissionMaterial backside samples={4} resolution={256} transmission={0.9} roughness={0.15} thickness={0.3} ior={1.4} color="#0EA5E9" />
-                </mesh>
-                {/* Right Leg */}
-                <mesh position={[0.25, -0.15, 0]}>
-                    <capsuleGeometry args={[0.15, 1.0, 8, 16]} />
-                    <MeshTransmissionMaterial backside samples={4} resolution={256} transmission={0.9} roughness={0.15} thickness={0.3} ior={1.4} color="#0EA5E9" />
-                </mesh>
-                {/* Inner glow ring */}
-                <mesh position={[0, 1.2, 0]}>
-                    <torusGeometry args={[0.55, 0.02, 16, 64]} />
-                    <meshStandardMaterial color="#0EA5E9" emissive="#0EA5E9" emissiveIntensity={3} transparent opacity={0.5} />
-                </mesh>
-            </group>
+            <mesh ref={bodyRef} position={[0, 0, 0]}>
+                <planeGeometry args={[2.5, 3.75]} />
+                <meshStandardMaterial 
+                    map={texture} 
+                    transparent={true} 
+                    opacity={0.9} 
+                    emissiveMap={texture} 
+                    emissiveIntensity={0.5} 
+                    emissive="#38BDF8"
+                    side={THREE.DoubleSide}
+                    depthWrite={false}
+                />
+            </mesh>
+            {/* Inner glow ring floating behind the image */}
+            <mesh position={[0, 0, -0.5]}>
+                <torusGeometry args={[1.2, 0.02, 16, 64]} />
+                <meshStandardMaterial color="#0EA5E9" emissive="#0EA5E9" emissiveIntensity={3} transparent opacity={0.5} />
+            </mesh>
         </Float>
     );
 }
@@ -161,7 +121,9 @@ export default function HeroScene() {
                 <pointLight position={[5, 5, 5]} intensity={1} color="#0EA5E9" />
                 <pointLight position={[-5, 3, -5]} intensity={0.5} color="#8B5CF6" />
                 <pointLight position={[0, -3, 3]} intensity={0.3} color="#10B981" />
-                <GlassBody />
+                <Suspense fallback={null}>
+                    <GlassBody />
+                </Suspense>
                 <Particles />
                 <Rings />
             </Canvas>
