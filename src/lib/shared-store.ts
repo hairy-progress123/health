@@ -109,16 +109,19 @@ export async function cloudAddAppointment(apt: Appointment): Promise<void> {
 
 export async function cloudGetDoctorAppointments(doctorId: string): Promise<(Appointment & { patientName: string; patientEmail: string })[]> {
     const users = await cloudGetAllUsers();
-    const results: (Appointment & { patientName: string; patientEmail: string })[] = [];
-    for (const user of users) {
-        const apts = (await cloudGet<Appointment[]>(`hs_appointments_${user.id}`)) || [];
-        for (const apt of apts) {
-            if (apt.doctorId === doctorId) {
-                results.push({ ...apt, patientName: user.name, patientEmail: user.email });
-            }
-        }
-    }
-    return results;
+    
+    // Fetch all user appointments in parallel
+    const allUsersApts = await Promise.all(
+        users.map(async (user) => {
+            const apts = (await cloudGet<Appointment[]>(`hs_appointments_${user.id}`)) || [];
+            return apts
+                .filter(apt => apt.doctorId === doctorId)
+                .map(apt => ({ ...apt, patientName: user.name, patientEmail: user.email }));
+        })
+    );
+
+    // Flatten the array of arrays
+    return allUsersApts.flat();
 }
 
 // ---------- Call Logs ----------
@@ -153,12 +156,17 @@ export async function cloudAddPrescription(prescription: Prescription): Promise<
 
 export async function cloudGetDoctorPrescriptions(doctorId: string): Promise<Prescription[]> {
     const users = await cloudGetAllUsers();
-    const all: Prescription[] = [];
-    for (const user of users) {
-        const presc = (await cloudGet<Prescription[]>(`hs_prescriptions_${user.id}`)) || [];
-        all.push(...presc.filter(p => p.doctorId === doctorId));
-    }
-    return all;
+    
+    // Fetch all user prescriptions in parallel
+    const allUsersPresc = await Promise.all(
+        users.map(async (user) => {
+            const presc = (await cloudGet<Prescription[]>(`hs_prescriptions_${user.id}`)) || [];
+            return presc.filter(p => p.doctorId === doctorId);
+        })
+    );
+
+    // Flatten the array of arrays
+    return allUsersPresc.flat();
 }
 
 // ---------- Notifications ----------
@@ -187,20 +195,31 @@ export async function cloudGetPatientData(userId: string, doctorId?: string) {
     const users = await cloudGetAllUsers();
     const user = users.find(u => u.id === userId);
     if (!user) return null;
-    const reports = (await cloudGet<unknown[]>(`hs_reports_${userId}`)) || [];
+
+    // Fetch all patient related data in parallel
+    const [reportsData, vitalsData, journeysData, chatHistoryData, prescriptionsData] = await Promise.all([
+        cloudGet<unknown[]>(`hs_reports_${userId}`),
+        cloudGet(`hs_vitals_${userId}`),
+        cloudGet(`hs_journeys_${userId}`),
+        cloudGet(`hs_chat_${userId}`),
+        cloudGetPatientPrescriptions(userId)
+    ]);
+
+    const reports = reportsData || [];
     const filteredReports = doctorId
         ? reports.filter((r: unknown) => {
             const rep = r as { sharedWith?: string[] };
             return rep.sharedWith?.includes(doctorId);
         })
         : reports;
+
     return {
         profile: user,
-        vitals: (await cloudGet(`hs_vitals_${userId}`)) || [],
+        vitals: vitalsData || [],
         reports: filteredReports,
-        journeys: (await cloudGet(`hs_journeys_${userId}`)) || [],
-        chatHistory: (await cloudGet(`hs_chat_${userId}`)) || [],
-        prescriptions: await cloudGetPatientPrescriptions(userId),
+        journeys: journeysData || [],
+        chatHistory: chatHistoryData || [],
+        prescriptions: prescriptionsData,
     };
 }
 
@@ -235,13 +254,16 @@ export async function cloudGetReports(userId: string): Promise<CloudReport[]> {
 }
 
 export async function cloudGetReportsForDoctor(doctorId: string, patientIds: string[]): Promise<CloudReport[]> {
-    const allReports: CloudReport[] = [];
-    for (const pid of patientIds) {
-        const reports = await cloudGetReports(pid);
-        const shared = reports.filter(r => r.sharedWith?.includes(doctorId));
-        allReports.push(...shared);
-    }
-    return allReports;
+    // Fetch reports for all patients in parallel
+    const allPatientReports = await Promise.all(
+        patientIds.map(async (pid) => {
+            const reports = await cloudGetReports(pid);
+            return reports.filter(r => r.sharedWith?.includes(doctorId));
+        })
+    );
+
+    // Flatten the array of arrays
+    return allPatientReports.flat();
 }
 
 export async function cloudShareReport(userId: string, reportId: string, doctorId: string): Promise<void> {
