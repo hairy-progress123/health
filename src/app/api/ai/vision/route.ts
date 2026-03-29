@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-const SAMBANOVA_API_KEY = process.env.SAMBANOVA_API_KEY || 'fbd09331-203a-486d-a5e9-ccaf9edbad9b';
+const SAMBANOVA_API_KEY = process.env.SAMBANOVA_API_KEY || 'Paste Your API key';
 
 export async function POST(request: NextRequest) {
     try {

@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 const GROQ_KEYS = [
-    process.env.GROQ_API_KEY_1 || '',
-    process.env.GROQ_API_KEY_2 || '',
+    process.env.GROQ_API_KEY_1 || 'Paste Your API key',
+    process.env.GROQ_API_KEY_2 || 'Paste Your API key',
 ];
 
 async function callGroq(messages: { role: string; content: string }[], systemPrompt: string, keyIndex = 0): Promise<string> {
