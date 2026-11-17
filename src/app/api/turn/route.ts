@@ -23,33 +23,31 @@ export async function GET() {
     }
 
     // Default: return reliable STUN + TURN configuration
-    // These use time-limited HMAC credentials for coturn-compatible servers
+    // These use active Metered global TURN relays
     const iceServers = [
+        { urls: 'stun:stun.relay.metered.ca:80' },
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun3.l.google.com:19302' },
-        { urls: 'stun:stun4.l.google.com:19302' },
-        // Free TURN servers from various providers
+        // Active Metered TURN servers
         {
-            urls: 'turn:a.relay.metered.ca:80',
-            username: 'e8dd65b92f1a1b3b0734ac6e',
-            credential: '5V960yrMdEVJSAhU',
+            urls: 'turn:global.relay.metered.ca:80',
+            username: '7322fe19c820841a7a89386a',
+            credential: 'nyS+IbWR3E2QiRTI',
         },
         {
-            urls: 'turn:a.relay.metered.ca:80?transport=tcp',
-            username: 'e8dd65b92f1a1b3b0734ac6e',
-            credential: '5V960yrMdEVJSAhU',
+            urls: 'turn:global.relay.metered.ca:80?transport=tcp',
+            username: '7322fe19c820841a7a89386a',
+            credential: 'nyS+IbWR3E2QiRTI',
         },
         {
-            urls: 'turn:a.relay.metered.ca:443',
-            username: 'e8dd65b92f1a1b3b0734ac6e',
-            credential: '5V960yrMdEVJSAhU',
+            urls: 'turn:global.relay.metered.ca:443',
+            username: '7322fe19c820841a7a89386a',
+            credential: 'nyS+IbWR3E2QiRTI',
         },
         {
-            urls: 'turns:a.relay.metered.ca:443?transport=tcp',
-            username: 'e8dd65b92f1a1b3b0734ac6e',
-            credential: '5V960yrMdEVJSAhU',
+            urls: 'turns:global.relay.metered.ca:443?transport=tcp',
+            username: '7322fe19c820841a7a89386a',
+            credential: 'nyS+IbWR3E2QiRTI',
         },
     ];
 
