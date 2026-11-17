@@ -282,20 +282,35 @@ export default function CallsPage() {
                             background: callType === 'video' ? 'linear-gradient(135deg, #0B1120, #1a0b2e)' : 'linear-gradient(135deg, #0B1120, #0c2035)',
                             display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 24,
                         }}>
+                        {/* Dedicated Audio Element for Remote Audio Playback */}
+                        <audio
+                            ref={el => {
+                                if (el && webrtc.remoteStream && el.srcObject !== webrtc.remoteStream) {
+                                    el.srcObject = webrtc.remoteStream;
+                                    el.play().catch(() => {});
+                                }
+                            }}
+                            autoPlay
+                            playsInline
+                        />
+
                         {/* Remote Video (full screen background) */}
                         {callType === 'video' && activeCall.status === 'ongoing' && (
                             <video
                                 ref={el => {
                                     if (el && webrtc.remoteStream && el.srcObject !== webrtc.remoteStream) {
                                         el.srcObject = webrtc.remoteStream;
-                                        el.play().catch(() => {});
+                                        el.play().catch(() => {
+                                            el.muted = true;
+                                            el.play().catch(() => {});
+                                        });
                                     }
                                 }}
                                 autoPlay playsInline
                                 style={{
                                     position: 'absolute', inset: 0, width: '100%', height: '100%',
                                     objectFit: 'cover',
-                                    display: webrtc.remoteStream ? 'block' : 'none',
+                                    display: (webrtc.remoteStream && webrtc.remoteStream.getVideoTracks().length > 0) ? 'block' : 'none',
                                 }}
                             />
                         )}
@@ -313,11 +328,11 @@ export default function CallsPage() {
                                     position: 'absolute', bottom: 100, right: 20, width: 130, height: 180,
                                     borderRadius: 14, objectFit: 'cover', border: '2px solid rgba(255,255,255,0.4)',
                                     zIndex: 10, background: '#000',
-                                    display: webrtc.localStream ? 'block' : 'none',
+                                    display: (webrtc.localStream && webrtc.localStream.getVideoTracks().length > 0) ? 'block' : 'none',
                                 }}
                             />
                         )}
-                        {callType === 'video' && activeCall.status === 'ongoing' && !webrtc.remoteStream && (
+                        {callType === 'video' && activeCall.status === 'ongoing' && (!webrtc.remoteStream || webrtc.remoteStream.getVideoTracks().length === 0) && (
                             <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: 0.1 }}>
                                 <Video size={200} />
                             </div>
@@ -346,7 +361,7 @@ export default function CallsPage() {
                         )}
 
                         {/* Patient info & Avatar (shown in Audio call OR while remote video is connecting) */}
-                        {(!webrtc.remoteStream || callType === 'audio') && (
+                        {(callType === 'audio' || !webrtc.remoteStream || webrtc.remoteStream.getVideoTracks().length === 0) && (
                             <>
                                 <div style={{
                                     width: 100, height: 100, borderRadius: '50%', background: 'var(--gradient-primary)',

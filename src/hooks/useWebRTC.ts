@@ -1,5 +1,5 @@
 // WebRTC hook — race-free signaling with separate Redis keys
-// TURN credentials fetched from /api/turn
+// TURN credentials fetched from /api/turn with reliable fallback
 // Each signal type has its own key to prevent read-modify-write races
 
 import { useRef, useCallback, useEffect, useState } from 'react';
@@ -9,12 +9,31 @@ import { cloudGet, cloudSet } from '@/lib/shared-store';
 
 const FALLBACK: RTCConfiguration = {
     iceServers: [
+        { urls: 'stun:stun.relay.metered.ca:80' },
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun3.l.google.com:19302' },
-        { urls: 'stun:stun4.l.google.com:19302' },
+        {
+            urls: 'turn:global.relay.metered.ca:80',
+            username: '7322fe19c820841a7a89386a',
+            credential: 'nyS+IbWR3E2QiRTI',
+        },
+        {
+            urls: 'turn:global.relay.metered.ca:80?transport=tcp',
+            username: '7322fe19c820841a7a89386a',
+            credential: 'nyS+IbWR3E2QiRTI',
+        },
+        {
+            urls: 'turn:global.relay.metered.ca:443',
+            username: '7322fe19c820841a7a89386a',
+            credential: 'nyS+IbWR3E2QiRTI',
+        },
+        {
+            urls: 'turns:global.relay.metered.ca:443?transport=tcp',
+            username: '7322fe19c820841a7a89386a',
+            credential: 'nyS+IbWR3E2QiRTI',
+        },
     ],
+    iceCandidatePoolSize: 10,
 };
 
 async function getIceConfig(): Promise<RTCConfiguration> {
@@ -22,20 +41,19 @@ async function getIceConfig(): Promise<RTCConfiguration> {
         const r = await fetch('/api/turn', { cache: 'no-store' });
         if (r.ok) {
             const d = await r.json();
-            return { iceServers: d.iceServers, iceCandidatePoolSize: 10 };
+            if (d.iceServers && d.iceServers.length > 0) {
+                return { iceServers: d.iceServers, iceCandidatePoolSize: 10 };
+            }
         }
     } catch { /* fallback */ }
     return FALLBACK;
 }
-// Pre-fetch on load
-if (typeof window !== 'undefined') getIceConfig();
 
-// ── Signaling — separate keys, no race conditions ───────────
+// ── Signaling types & keys ───────────────────────────────────
 
 type IceEntry = { candidate: string; sdpMid: string | null; sdpMLineIndex: number | null };
 type SdpEntry = { type: string; sdp: string };
 
-// Each signal component gets its own Redis key
 const KEY = {
     offer: (id: string) => `rtc_offer_${id}`,
     answer: (id: string) => `rtc_answer_${id}`,
@@ -62,6 +80,15 @@ async function getMedia(type: 'audio' | 'video'): Promise<MediaStream> {
         });
     } catch (err: unknown) {
         const e = err as Error;
+        if (type === 'video' && e.name === 'NotFoundError') {
+            try {
+                // Fallback to audio-only if webcam hardware is missing
+                return await navigator.mediaDevices.getUserMedia({
+                    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+                    video: false,
+                });
+            } catch { /* proceed to throw */ }
+        }
         if (e.name === 'NotAllowedError')
             throw new Error('Please allow ' + (type === 'video' ? 'camera and microphone' : 'microphone') + ' access in your browser settings');
         if (e.name === 'NotFoundError')
@@ -75,17 +102,21 @@ async function getMedia(type: 'audio' | 'video'): Promise<MediaStream> {
 export function useWebRTC() {
     const pcRef = useRef<RTCPeerConnection | null>(null);
     const localStreamRef = useRef<MediaStream | null>(null);
+    const remoteMediaStreamRef = useRef<MediaStream | null>(null);
     const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-    const icePushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const mountedRef = useRef(true);
     const audioRef = useRef<HTMLAudioElement | null>(null);
+
+    // Call tracking refs to prevent re-entrant teardown loops
+    const activeCallIdRef = useRef<string | null>(null);
+    const isStartingRef = useRef(false);
 
     const [localStream, setLocalStream] = useState<MediaStream | null>(null);
     const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
     const [isConnected, setIsConnected] = useState(false);
     const [permissionError, setPermissionError] = useState<string | null>(null);
 
-    // ── Auto-play remote audio ──
+    // ── Dedicated audio element for playing remote audio ──
     useEffect(() => {
         if (!remoteStream || remoteStream.getAudioTracks().length === 0) return;
         if (!audioRef.current) {
@@ -95,9 +126,6 @@ export function useWebRTC() {
             a.style.cssText = 'position:fixed;top:-9999px;left:-9999px;';
             document.body.appendChild(a);
             audioRef.current = a;
-            // Try to force speaker
-            (a as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> })
-                .setSinkId?.('default').catch(() => { });
         }
         audioRef.current.srcObject = remoteStream;
         audioRef.current.play().catch(() => {
@@ -107,21 +135,43 @@ export function useWebRTC() {
 
     useEffect(() => {
         mountedRef.current = true;
-        return () => { mountedRef.current = false; cleanupAll(); };
+        return () => {
+            mountedRef.current = false;
+            cleanupAll();
+        };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     const cleanupAll = () => {
-        if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-        if (icePushTimer.current) { clearTimeout(icePushTimer.current); icePushTimer.current = null; }
-        localStreamRef.current?.getTracks().forEach(t => t.stop());
-        localStreamRef.current = null;
-        pcRef.current?.close();
-        pcRef.current = null;
+        activeCallIdRef.current = null;
+        isStartingRef.current = false;
+
+        if (pollRef.current) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+        }
+
+        if (localStreamRef.current) {
+            localStreamRef.current.getTracks().forEach(t => t.stop());
+            localStreamRef.current = null;
+        }
+
+        if (remoteMediaStreamRef.current) {
+            remoteMediaStreamRef.current.getTracks().forEach(t => t.stop());
+            remoteMediaStreamRef.current = null;
+        }
+
+        if (pcRef.current) {
+            try { pcRef.current.close(); } catch { }
+            pcRef.current = null;
+        }
+
         if (audioRef.current) {
-            audioRef.current.pause();
-            audioRef.current.srcObject = null;
-            audioRef.current.remove();
+            try {
+                audioRef.current.pause();
+                audioRef.current.srcObject = null;
+                audioRef.current.remove();
+            } catch { }
             audioRef.current = null;
         }
     };
@@ -138,227 +188,312 @@ export function useWebRTC() {
     const setupPC = (config: RTCConfiguration, stream: MediaStream) => {
         const pc = new RTCPeerConnection(config);
         pcRef.current = pc;
+
+        // Add local tracks to peer connection
         stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
+        // Persistent remote media stream container
+        const streamContainer = new MediaStream();
+        remoteMediaStreamRef.current = streamContainer;
+
         pc.ontrack = (e) => {
-            console.log('[WebRTC] ontrack received:', e.track.kind, e.streams);
-            if (mountedRef.current) {
-                const rs = e.streams[0] || new MediaStream([e.track]);
-                setRemoteStream(rs);
-                // Also unmute audio if browser suspended it
-                if (e.track.kind === 'audio' && audioRef.current) {
-                    audioRef.current.srcObject = rs;
-                    audioRef.current.play().catch(err => console.log('Audio autoplay blocked:', err));
-                }
+            console.log('[WebRTC] ontrack received:', e.track.kind, e.track.id);
+            if (!mountedRef.current) return;
+
+            // Mark connected since media is arriving
+            setIsConnected(true);
+
+            // Accumulate track if not already in container
+            if (!streamContainer.getTracks().some(t => t.id === e.track.id)) {
+                streamContainer.addTrack(e.track);
             }
+
+            // Provide new MediaStream instance so React components re-render with updated tracks
+            const newStream = new MediaStream(streamContainer.getTracks());
+            setRemoteStream(newStream);
+
+            if (e.track.kind === 'audio' && audioRef.current) {
+                audioRef.current.srcObject = newStream;
+                audioRef.current.play().catch(err => console.log('Audio autoplay blocked:', err));
+            }
+
+            e.track.onunmute = () => {
+                console.log('[WebRTC] track onunmute:', e.track.kind);
+                if (mountedRef.current) {
+                    setRemoteStream(new MediaStream(streamContainer.getTracks()));
+                    if (e.track.kind === 'audio' && audioRef.current) {
+                        audioRef.current.play().catch(() => { });
+                    }
+                }
+            };
         };
+
         pc.onconnectionstatechange = () => {
             const s = pc.connectionState;
-            console.log('[WebRTC] connectionState:', s);
+            console.log('[WebRTC] connectionState:', s, 'iceState:', pc.iceConnectionState);
             if (mountedRef.current) {
-                if (s === 'connected') {
+                if (s === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
                     setIsConnected(true);
-                } else if (s === 'disconnected' || s === 'failed') {
-                    // Only drop connected flag if both connectionState and iceConnectionState are not connected
-                    if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') {
-                        setIsConnected(false);
-                    }
+                } else if (s === 'failed' || s === 'closed') {
+                    setIsConnected(false);
                 }
             }
             if (s === 'failed') {
-                console.warn('[WebRTC] Connection FAILED — restarting ICE');
+                console.warn('[WebRTC] Connection failed, attempting ICE restart');
                 try { pc.restartIce(); } catch { }
             }
         };
+
         pc.oniceconnectionstatechange = () => {
             const s = pc.iceConnectionState;
             console.log('[WebRTC] iceConnectionState:', s);
             if (mountedRef.current) {
-                if (s === 'connected' || s === 'completed') {
+                if (s === 'connected' || s === 'completed' || pc.connectionState === 'connected') {
                     setIsConnected(true);
                 } else if (s === 'failed') {
                     setIsConnected(false);
                 }
             }
         };
+
         return pc;
     };
 
-    // ── ICE candidate batching ──
-    const createIcePusher = (callId: string, key: string) => {
-        const buf: IceEntry[] = [];
-        let scheduled = false;
-        const flush = async () => {
-            if (buf.length > 0 && mountedRef.current) {
-                // Append to existing (read + append + write)
-                const existing = (await sigGet<IceEntry[]>(key)) || [];
-                await sigSet(key, [...existing, ...buf.splice(0)]);
+    // ── Safe ICE Pusher (writes accumulated local candidates without read races) ──
+    const createIcePusher = (key: string) => {
+        const allCandidates: IceEntry[] = [];
+        let flushTimer: ReturnType<typeof setTimeout> | null = null;
+        let isFlushing = false;
+        let pendingFlush = false;
+
+        const doFlush = async () => {
+            if (!mountedRef.current || allCandidates.length === 0) return;
+            isFlushing = true;
+            try {
+                await sigSet(key, [...allCandidates]);
+            } catch (e) {
+                console.error('[WebRTC] Failed to save ICE candidates:', e);
+            } finally {
+                isFlushing = false;
+                if (pendingFlush) {
+                    pendingFlush = false;
+                    scheduleFlush(100);
+                }
             }
-            scheduled = false;
         };
+
+        const scheduleFlush = (delay = 200) => {
+            if (flushTimer) clearTimeout(flushTimer);
+            flushTimer = setTimeout(() => {
+                flushTimer = null;
+                if (isFlushing) {
+                    pendingFlush = true;
+                } else {
+                    doFlush();
+                }
+            }, delay);
+        };
+
         return {
             push: (c: RTCIceCandidate) => {
-                buf.push({ candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex });
-                if (!scheduled) {
-                    scheduled = true;
-                    icePushTimer.current = setTimeout(flush, 300);
-                }
+                allCandidates.push({ candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex });
+                scheduleFlush(200);
             },
-            flush,
+            flush: () => {
+                if (flushTimer) clearTimeout(flushTimer);
+                doFlush();
+            },
         };
+    };
+
+    // ── Safe ICE Candidate Applicator ──
+    const applyIceCandidates = async (pc: RTCPeerConnection, candidates: IceEntry[], appliedSet: Set<string>) => {
+        if (!pc.remoteDescription || !pc.localDescription) {
+            // Cannot add candidates until signaling state is stable with both descriptions set
+            return;
+        }
+        for (const c of candidates) {
+            if (!c.candidate || appliedSet.has(c.candidate)) continue;
+            try {
+                await pc.addIceCandidate(new RTCIceCandidate(c));
+                appliedSet.add(c.candidate);
+            } catch {
+                // If temporary error, leave unadded so next poll will retry
+            }
+        }
     };
 
     // ═══════════ CALLER (Doctor) ═══════════
     const startAsCallerAsync = useCallback(async (callId: string, callType: 'audio' | 'video' = 'audio') => {
+        if (activeCallIdRef.current === callId && (isStartingRef.current || pcRef.current)) {
+            console.log('[WebRTC] Caller already initialized for call', callId);
+            return;
+        }
+
         cleanup();
+        activeCallIdRef.current = callId;
+        isStartingRef.current = true;
         setPermissionError(null);
 
-        // Parallel: get media + TURN config
-        const [stream, config] = await Promise.all([
-            getMedia(callType).catch((e: Error) => { setPermissionError(e.message); throw e; }),
-            getIceConfig(),
-        ]);
-        localStreamRef.current = stream;
-        setLocalStream(stream);
+        try {
+            // Parallel: get media + TURN config
+            const [stream, config] = await Promise.all([
+                getMedia(callType).catch((e: Error) => { setPermissionError(e.message); throw e; }),
+                getIceConfig(),
+            ]);
 
-        const pc = setupPC(config, stream);
+            localStreamRef.current = stream;
+            setLocalStream(stream);
 
-        // ICE candidate batching → separate key
-        const icePusher = createIcePusher(callId, KEY.callerIce(callId));
-        pc.onicecandidate = (e) => { if (e.candidate) icePusher.push(e.candidate); };
+            const pc = setupPC(config, stream);
 
-        // Create and send offer immediately
-        const offer = await pc.createOffer({
-            offerToReceiveAudio: true,
-            offerToReceiveVideo: callType === 'video',
-        });
-        await pc.setLocalDescription(offer);
-        await sigSet(KEY.offer(callId), { type: offer.type, sdp: offer.sdp || '' });
+            // ICE candidate pusher → writes to caller ICE key
+            const icePusher = createIcePusher(KEY.callerIce(callId));
+            pc.onicecandidate = (e) => {
+                if (e.candidate) {
+                    icePusher.push(e.candidate);
+                } else {
+                    icePusher.flush();
+                }
+            };
 
-        // Poll for answer + callee ICE on separate keys (fast: 500ms)
-        let answerApplied = false;
-        let lastIceCount = 0;
-        pollRef.current = setInterval(async () => {
-            if (!mountedRef.current || !pcRef.current) {
-                if (pollRef.current) clearInterval(pollRef.current);
-                return;
-            }
-            const p = pcRef.current;
+            // Create and send offer
+            const offer = await pc.createOffer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: callType === 'video',
+            });
+            await pc.setLocalDescription(offer);
+            await sigSet(KEY.offer(callId), { type: offer.type, sdp: offer.sdp || '' });
 
-            // Check for answer
-            if (!answerApplied) {
-                const ans = await sigGet<SdpEntry>(KEY.answer(callId));
-                if (ans && p.signalingState === 'have-local-offer') {
-                    try {
-                        await p.setRemoteDescription(new RTCSessionDescription({ type: ans.type as RTCSdpType, sdp: ans.sdp }));
-                        answerApplied = true;
-                        // Flush our remaining candidates
-                        icePusher.flush();
-                    } catch (e) {
-                        console.error('[WebRTC] Failed to set answer:', e);
+            isStartingRef.current = false;
+
+            // Poll for Callee's Answer and Callee ICE candidates
+            let answerApplied = false;
+            const appliedCalleeIce = new Set<string>();
+
+            pollRef.current = setInterval(async () => {
+                if (!mountedRef.current || !pcRef.current || pcRef.current.connectionState === 'closed') {
+                    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+                    return;
+                }
+                const p = pcRef.current;
+
+                // 1. Check for answer
+                if (!answerApplied) {
+                    const ans = await sigGet<SdpEntry>(KEY.answer(callId));
+                    if (ans && p.signalingState === 'have-local-offer') {
+                        try {
+                            await p.setRemoteDescription(new RTCSessionDescription({ type: ans.type as RTCSdpType, sdp: ans.sdp }));
+                            answerApplied = true;
+                            icePusher.flush();
+                        } catch (e) {
+                            console.error('[WebRTC] Failed to set remote answer:', e);
+                        }
                     }
                 }
-            }
 
-            // Check for callee ICE candidates 
-            const ice = await sigGet<IceEntry[]>(KEY.calleeIce(callId));
-            if (ice && ice.length > lastIceCount) {
-                const newOnes = ice.slice(lastIceCount);
-                lastIceCount = ice.length;
-                for (const c of newOnes) {
-                    try { await p.addIceCandidate(new RTCIceCandidate(c)); } catch { /* ok */ }
-                }
-            }
-
-            // Don't stop polling too early, keep polling for late candidates
-            if (answerApplied && (p.iceConnectionState === 'connected' || p.iceConnectionState === 'completed')) {
-                setTimeout(() => {
-                    if (pollRef.current && (p.iceConnectionState === 'connected' || p.iceConnectionState === 'completed')) {
-                        clearInterval(pollRef.current);
-                        pollRef.current = null;
+                // 2. Once answer is applied, apply any Callee ICE candidates
+                if (answerApplied && p.remoteDescription && p.localDescription) {
+                    const calleeIce = await sigGet<IceEntry[]>(KEY.calleeIce(callId));
+                    if (calleeIce && calleeIce.length > 0) {
+                        await applyIceCandidates(p, calleeIce, appliedCalleeIce);
                     }
-                }, 10000);
-            }
-        }, 500);
+                }
+            }, 500);
 
+        } catch (e) {
+            isStartingRef.current = false;
+            throw e;
+        }
     }, [cleanup]);
 
     // ═══════════ CALLEE (Patient) ═══════════
     const startAsCalleeAsync = useCallback(async (callId: string, callType: 'audio' | 'video' = 'audio') => {
-        cleanup();
-        setPermissionError(null);
-
-        // Parallel: fetch offer + get media + TURN config
-        const [offerData, stream, config] = await Promise.all([
-            // Retry fetching offer up to 6 times (3 seconds)
-            (async () => {
-                for (let i = 0; i < 6; i++) {
-                    const o = await sigGet<SdpEntry>(KEY.offer(callId));
-                    if (o) return o;
-                    await new Promise(r => setTimeout(r, 500));
-                }
-                return null;
-            })(),
-            getMedia(callType).catch((e: Error) => { setPermissionError(e.message); throw e; }),
-            getIceConfig(),
-        ]);
-
-        if (!offerData) {
-            setPermissionError('Could not find call signal. Please try again.');
-            stream.getTracks().forEach(t => t.stop());
+        if (activeCallIdRef.current === callId && (isStartingRef.current || pcRef.current)) {
+            console.log('[WebRTC] Callee already initialized for call', callId);
             return;
         }
 
-        localStreamRef.current = stream;
-        setLocalStream(stream);
+        cleanup();
+        activeCallIdRef.current = callId;
+        isStartingRef.current = true;
+        setPermissionError(null);
 
-        const pc = setupPC(config, stream);
+        try {
+            // Parallel: fetch offer + get media + TURN config
+            const [offerData, stream, config] = await Promise.all([
+                (async () => {
+                    for (let i = 0; i < 10; i++) {
+                        const o = await sigGet<SdpEntry>(KEY.offer(callId));
+                        if (o) return o;
+                        await new Promise(r => setTimeout(r, 400));
+                    }
+                    return null;
+                })(),
+                getMedia(callType).catch((e: Error) => { setPermissionError(e.message); throw e; }),
+                getIceConfig(),
+            ]);
 
-        // ICE candidate batching → separate key
-        const icePusher = createIcePusher(callId, KEY.calleeIce(callId));
-        pc.onicecandidate = (e) => { if (e.candidate) icePusher.push(e.candidate); };
-
-        // Set remote offer
-        await pc.setRemoteDescription(new RTCSessionDescription({
-            type: offerData.type as RTCSdpType,
-            sdp: offerData.sdp,
-        }));
-
-        // Add any caller ICE candidates already available
-        const callerIce = await sigGet<IceEntry[]>(KEY.callerIce(callId));
-        let lastCallerIceCount = callerIce?.length || 0;
-        if (callerIce) {
-            for (const c of callerIce) {
-                try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch { /* ok */ }
-            }
-        }
-
-        // Create and send answer immediately
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        await sigSet(KEY.answer(callId), { type: answer.type, sdp: answer.sdp || '' });
-
-        // Flush ICE candidates after short delay
-        setTimeout(() => icePusher.flush(), 500);
-
-        // Poll for new caller ICE candidates (500ms, up to 30 seconds)
-        let pollCount = 0;
-        pollRef.current = setInterval(async () => {
-            pollCount++;
-            if (!mountedRef.current || !pcRef.current || pollCount > 60) {
-                if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+            if (!offerData) {
+                setPermissionError('Could not find call signal. Please try again.');
+                stream.getTracks().forEach(t => t.stop());
+                isStartingRef.current = false;
                 return;
             }
-            const ice = await sigGet<IceEntry[]>(KEY.callerIce(callId));
-            if (ice && ice.length > lastCallerIceCount) {
-                const newOnes = ice.slice(lastCallerIceCount);
-                lastCallerIceCount = ice.length;
-                for (const c of newOnes) {
-                    try { await pcRef.current!.addIceCandidate(new RTCIceCandidate(c)); } catch { /* ok */ }
-                }
-            }
-        }, 500);
 
+            localStreamRef.current = stream;
+            setLocalStream(stream);
+
+            const pc = setupPC(config, stream);
+
+            // ICE candidate pusher → writes to callee ICE key
+            const icePusher = createIcePusher(KEY.calleeIce(callId));
+            pc.onicecandidate = (e) => {
+                if (e.candidate) {
+                    icePusher.push(e.candidate);
+                } else {
+                    icePusher.flush();
+                }
+            };
+
+            // 1. Set remote offer
+            await pc.setRemoteDescription(new RTCSessionDescription({
+                type: offerData.type as RTCSdpType,
+                sdp: offerData.sdp,
+            }));
+
+            // 2. Create and set local answer
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            await sigSet(KEY.answer(callId), { type: answer.type, sdp: answer.sdp || '' });
+
+            isStartingRef.current = false;
+            icePusher.flush();
+
+            // 3. Now that BOTH descriptions are set, safely apply any Caller ICE candidates
+            const appliedCallerIce = new Set<string>();
+            const initialCallerIce = await sigGet<IceEntry[]>(KEY.callerIce(callId));
+            if (initialCallerIce && initialCallerIce.length > 0) {
+                await applyIceCandidates(pc, initialCallerIce, appliedCallerIce);
+            }
+
+            // 4. Poll for additional Caller ICE candidates (500ms interval)
+            pollRef.current = setInterval(async () => {
+                if (!mountedRef.current || !pcRef.current || pcRef.current.connectionState === 'closed') {
+                    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+                    return;
+                }
+                const p = pcRef.current;
+                const latestCallerIce = await sigGet<IceEntry[]>(KEY.callerIce(callId));
+                if (latestCallerIce && latestCallerIce.length > 0) {
+                    await applyIceCandidates(p, latestCallerIce, appliedCallerIce);
+                }
+            }, 500);
+
+        } catch (e) {
+            isStartingRef.current = false;
+            throw e;
+        }
     }, [cleanup]);
 
     // ── Controls ──

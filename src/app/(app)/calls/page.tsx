@@ -21,9 +21,11 @@ export default function UserCallsPage() {
     const [isCamOff, setIsCamOff] = useState(false);
     const [isScreenShare, setIsScreenShare] = useState(false);
     const [callDuration, setCallDuration] = useState(0);
+
     const activeCallRef = useRef<CallLog | null>(null);
     const callDurationRef = useRef(0);
     const userIdRef = useRef('');
+    const startingCallIdRef = useRef<string | null>(null);
 
     useEffect(() => { activeCallRef.current = activeCall; }, [activeCall]);
     useEffect(() => { callDurationRef.current = callDuration; }, [callDuration]);
@@ -44,23 +46,26 @@ export default function UserCallsPage() {
                 const call = await cloudGetActiveCall();
                 if (!isMounted) return;
                 if (call && call.userId === userId && (call.status === 'ringing' || call.status === 'ongoing')) {
-                    // If we weren't in a call, or call id changed, set it
+                    // Update activeCall if call id changed or status changed
                     setActiveCall(prev => {
                         if (!prev || prev.id !== call.id) return call;
-                        // Keep previous reference if status didn't change
                         if (prev.status !== call.status) return call;
                         return prev;
                     });
 
-                    // If call is already ongoing and we haven't started WebRTC callee yet
-                    if (call.status === 'ongoing' && !webrtc.isConnected && !webrtc.localStream) {
-                        try {
-                            webrtc.startAsCalleeAsync(call.id, call.type || 'audio');
-                        } catch (err) {
-                            console.error('Auto-start callee WebRTC failed:', err);
+                    // If call is ongoing and we haven't started WebRTC callee yet for this call
+                    if (call.status === 'ongoing') {
+                        if (startingCallIdRef.current !== call.id) {
+                            startingCallIdRef.current = call.id;
+                            try {
+                                webrtc.startAsCalleeAsync(call.id, call.type || 'audio');
+                            } catch (err) {
+                                console.error('Auto-start callee WebRTC failed:', err);
+                            }
                         }
                     }
                 } else if (activeCallRef.current && call === null) {
+                    startingCallIdRef.current = null;
                     webrtc.stopCall();
                     setActiveCall(null);
                     setCallDuration(0);
@@ -85,15 +90,18 @@ export default function UserCallsPage() {
 
     const acceptCall = async () => {
         if (!activeCall) return;
+        startingCallIdRef.current = activeCall.id;
         await cloudUpdateCallLog(activeCall.id, { status: 'ongoing' });
         setActiveCall(prev => prev ? { ...prev, status: 'ongoing' } : null);
         setCallDuration(0);
+
         // Start WebRTC as callee — create SDP answer from doctor's offer
         try {
             await webrtc.startAsCalleeAsync(activeCall.id, activeCall.type || 'audio');
         } catch (e) {
             console.error('WebRTC callee setup failed:', e);
         }
+
         await cloudAddNotification({
             id: generateId(), userId, type: 'call',
             title: `${activeCall.type === 'video' ? 'Video' : 'Audio'} Call Started`,
@@ -104,6 +112,7 @@ export default function UserCallsPage() {
 
     const rejectCall = async () => {
         if (!activeCall) return;
+        startingCallIdRef.current = null;
         webrtc.stopCall();
         await cloudUpdateCallLog(activeCall.id, { status: 'missed', endTime: new Date().toISOString() });
         await cloudAddNotification({
@@ -120,6 +129,7 @@ export default function UserCallsPage() {
     const endCall = async () => {
         const call = activeCallRef.current;
         if (!call) return;
+        startingCallIdRef.current = null;
         webrtc.stopCall();
         await cloudUpdateCallLog(call.id, { status: 'completed', endTime: new Date().toISOString(), duration: callDurationRef.current });
         await cloudAddNotification({
@@ -167,6 +177,7 @@ export default function UserCallsPage() {
                 </div>
             )}
 
+            {/* Incoming Call Overlay */}
             <AnimatePresence>
                 {activeCall && activeCall.status === 'ringing' && (
                     <motion.div initial={{ opacity: 0, y: -30 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -30 }}
@@ -217,6 +228,7 @@ export default function UserCallsPage() {
                 )}
             </AnimatePresence>
 
+            {/* Ongoing Call Screen */}
             <AnimatePresence>
                 {activeCall && activeCall.status === 'ongoing' && (
                     <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }}
@@ -225,24 +237,42 @@ export default function UserCallsPage() {
                             background: activeCall.type === 'video' ? 'linear-gradient(135deg, #0B1120, #1a0b2e)' : 'linear-gradient(135deg, #0B1120, #0c2035)',
                             display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 24,
                         }}>
-                        {/* Remote Video (full screen background) */}
+
+                        {/* Dedicated Audio Element for Remote Audio Playback */}
+                        <audio
+                            ref={el => {
+                                if (el && webrtc.remoteStream && el.srcObject !== webrtc.remoteStream) {
+                                    el.srcObject = webrtc.remoteStream;
+                                    el.play().catch(() => {});
+                                }
+                            }}
+                            autoPlay
+                            playsInline
+                        />
+
+                        {/* Remote Video (doctor's video in video call) */}
                         {activeCall.type === 'video' && (
                             <video
                                 ref={el => {
                                     if (el && webrtc.remoteStream && el.srcObject !== webrtc.remoteStream) {
                                         el.srcObject = webrtc.remoteStream;
-                                        el.play().catch(() => {});
+                                        el.play().catch(() => {
+                                            el.muted = true;
+                                            el.play().catch(() => {});
+                                        });
                                     }
                                 }}
-                                autoPlay playsInline
+                                autoPlay
+                                playsInline
                                 style={{
                                     position: 'absolute', inset: 0, width: '100%', height: '100%',
                                     objectFit: 'cover',
-                                    display: webrtc.remoteStream ? 'block' : 'none',
+                                    display: (webrtc.remoteStream && webrtc.remoteStream.getVideoTracks().length > 0) ? 'block' : 'none',
                                 }}
                             />
                         )}
-                        {/* Local Video (small pip) */}
+
+                        {/* Local Video (patient's picture-in-picture) */}
                         {activeCall.type === 'video' && (
                             <video
                                 ref={el => {
@@ -251,20 +281,24 @@ export default function UserCallsPage() {
                                         el.play().catch(() => {});
                                     }
                                 }}
-                                autoPlay playsInline muted
+                                autoPlay
+                                playsInline
+                                muted
                                 style={{
                                     position: 'absolute', bottom: 100, right: 20, width: 130, height: 180,
                                     borderRadius: 14, objectFit: 'cover', border: '2px solid rgba(255,255,255,0.4)',
                                     zIndex: 10, background: '#000',
-                                    display: webrtc.localStream ? 'block' : 'none',
+                                    display: (webrtc.localStream && webrtc.localStream.getVideoTracks().length > 0) ? 'block' : 'none',
                                 }}
                             />
                         )}
-                        {activeCall.type === 'video' && !webrtc.remoteStream && (
+
+                        {activeCall.type === 'video' && (!webrtc.remoteStream || webrtc.remoteStream.getVideoTracks().length === 0) && (
                             <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: 0.1 }}>
                                 <Video size={200} />
                             </div>
                         )}
+
                         {isScreenShare && (
                             <div style={{
                                 position: 'absolute', top: 20, left: 20, padding: '8px 16px', borderRadius: 10,
@@ -272,8 +306,9 @@ export default function UserCallsPage() {
                                 color: '#10B981', fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6,
                             }}><Monitor size={14} /> Screen Sharing Active</div>
                         )}
-                        {/* Patient info & Avatar (shown in Audio call OR while remote video is connecting) */}
-                        {(!webrtc.remoteStream || activeCall.type === 'audio') && (
+
+                        {/* Doctor info & Avatar (shown in Audio call OR while remote video track is not yet active) */}
+                        {(activeCall.type === 'audio' || !webrtc.remoteStream || webrtc.remoteStream.getVideoTracks().length === 0) && (
                             <>
                                 <div style={{
                                     width: 100, height: 100, borderRadius: '50%', background: 'var(--gradient-primary)',
@@ -285,15 +320,18 @@ export default function UserCallsPage() {
                                 <h2 style={{ fontSize: 24, fontWeight: 700, color: 'white', zIndex: 2 }}>{activeCall.doctorName}</h2>
                             </>
                         )}
+
                         <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: 14, zIndex: 2, textShadow: '0 1px 4px rgba(0,0,0,0.8)' }}>
                             {formatDuration(callDuration)}
                         </p>
+
                         {/* Permission error */}
                         {webrtc.permissionError && (
                             <div style={{ padding: '8px 16px', borderRadius: 8, background: 'rgba(239,68,68,0.2)', border: '1px solid rgba(239,68,68,0.3)', color: '#FCA5A5', fontSize: 12, maxWidth: 300, textAlign: 'center', zIndex: 2 }}>
                                 {webrtc.permissionError}
                             </div>
                         )}
+
                         {/* Connection status */}
                         <div style={{ display: 'flex', alignItems: 'center', gap: 6, zIndex: 2, background: 'rgba(0,0,0,0.5)', padding: '4px 12px', borderRadius: 20 }}>
                             <div style={{ width: 8, height: 8, borderRadius: '50%', background: webrtc.isConnected ? '#10B981' : '#F59E0B' }} />
@@ -301,6 +339,8 @@ export default function UserCallsPage() {
                                 {webrtc.isConnected ? 'Connected' : 'Connecting...'}
                             </span>
                         </div>
+
+                        {/* Call Action Controls */}
                         <div style={{ display: 'flex', gap: 16, marginTop: 20, position: 'relative', zIndex: 10000 }}>
                             <button onClick={() => { const newVal = !isMuted; setIsMuted(newVal); webrtc.toggleMute(newVal); }} style={{
                                 width: 56, height: 56, borderRadius: '50%', border: 'none', cursor: 'pointer',
@@ -309,6 +349,7 @@ export default function UserCallsPage() {
                             }}>
                                 {isMuted ? <MicOff size={22} /> : <Mic size={22} />}
                             </button>
+
                             {activeCall.type === 'video' && (
                                 <>
                                     <button onClick={() => { const newVal = !isCamOff; setIsCamOff(newVal); webrtc.toggleCamera(newVal); }} style={{
@@ -327,6 +368,7 @@ export default function UserCallsPage() {
                                     </button>
                                 </>
                             )}
+
                             <button onClick={endCall} style={{
                                 width: 56, height: 56, borderRadius: '50%', border: 'none', cursor: 'pointer',
                                 background: '#EF4444', color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -338,6 +380,7 @@ export default function UserCallsPage() {
                 )}
             </AnimatePresence>
 
+            {/* History Table */}
             {callHistory.length === 0 ? (
                 <div className="glass-card-static" style={{ padding: 60, textAlign: 'center' }}>
                     <Phone size={48} style={{ color: 'var(--text-muted)', marginBottom: 14, opacity: 0.3 }} />
