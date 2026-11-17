@@ -13,7 +13,7 @@ async function callGroq(messages: { role: string; content: string }[], systemPro
             'Authorization': `Bearer ${GROQ_KEYS[keyIndex]}`,
         },
         body: JSON.stringify({
-            model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+            model: 'openai/gpt-oss-20b',
             messages: [
                 { role: 'system', content: systemPrompt },
                 ...messages.map(m => ({

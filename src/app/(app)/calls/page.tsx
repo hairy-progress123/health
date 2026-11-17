@@ -38,18 +38,27 @@ export default function UserCallsPage() {
 
     useEffect(() => {
         if (!userId) return;
+        let isMounted = true;
         const interval = setInterval(async () => {
-            const call = await cloudGetActiveCall();
-            if (call && call.userId === userId && (call.status === 'ringing' || call.status === 'ongoing')) {
-                setActiveCall(call);
-            } else if (activeCallRef.current && call === null) {
-                setActiveCall(null);
-                setCallDuration(0);
-                const history = await cloudGetCallLogs(userId, 'user');
-                setCallHistory(history);
+            try {
+                const call = await cloudGetActiveCall();
+                if (!isMounted) return;
+                if (call && call.userId === userId && (call.status === 'ringing' || call.status === 'ongoing')) {
+                    setActiveCall(call);
+                } else if (activeCallRef.current && call === null) {
+                    setActiveCall(null);
+                    setCallDuration(0);
+                    const history = await cloudGetCallLogs(userId, 'user');
+                    if (isMounted) setCallHistory(history);
+                }
+            } catch {
+                // Ignore transient network errors
             }
-        }, 1500);
-        return () => clearInterval(interval);
+        }, 4000);
+        return () => {
+            isMounted = false;
+            clearInterval(interval);
+        };
     }, [userId]);
 
     useEffect(() => {

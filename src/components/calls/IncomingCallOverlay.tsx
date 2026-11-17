@@ -20,15 +20,24 @@ export default function IncomingCallOverlay() {
 
     useEffect(() => {
         if (!userId) return;
+        let isMounted = true;
         const interval = setInterval(async () => {
-            const call = await cloudGetActiveCall();
-            if (call && call.userId === userId && call.status === 'ringing') {
-                setActiveCall(call);
-            } else {
-                setActiveCall(null);
+            try {
+                const call = await cloudGetActiveCall();
+                if (!isMounted) return;
+                if (call && call.userId === userId && call.status === 'ringing') {
+                    setActiveCall(call);
+                } else {
+                    setActiveCall(null);
+                }
+            } catch {
+                // Ignore transient network errors
             }
-        }, 1500);
-        return () => clearInterval(interval);
+        }, 5000);
+        return () => {
+            isMounted = false;
+            clearInterval(interval);
+        };
     }, [userId]);
 
     const acceptCall = async () => {

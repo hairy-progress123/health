@@ -47,7 +47,6 @@ const translations: Record<string, Record<LangCode, string>> = {
     'nav.calls': { en: 'Calls', hi: 'कॉल', ta: 'அழைப்புகள்', kn: 'ಕರೆಗಳು', bn: 'কল', mr: 'कॉल' },
     'nav.recoveryCircle': { en: 'Recovery Circle', hi: 'रिकवरी सर्कल', ta: 'மீட்பு வட்டம்', kn: 'ಚೇತರಿಕೆ ವಲಯ', bn: 'পুনরুদ্ধার বৃত্ত', mr: 'रिकव्हरी सर्कल' },
     'nav.medicines': { en: 'Medicines', hi: 'दवाइयाँ', ta: 'மருந்துகள்', kn: 'ಔಷಧಿಗಳು', bn: 'ওষুধ', mr: 'औषधे' },
-    'nav.physicsLab': { en: 'Physics Lab', hi: 'भौतिकी प्रयोगशाला', ta: 'இயற்பியல் ஆய்வகம்', kn: 'ಭೌತಶಾಸ್ತ್ರ ಪ್ರಯೋಗಾಲಯ', bn: 'পদার্থবিদ্যা ল্যাব', mr: 'भौतिकशास्त्र प्रयोगशाळा' },
     'nav.notifications': { en: 'Notifications', hi: 'सूचनाएँ', ta: 'அறிவிப்புகள்', kn: 'ಅಧಿಸೂಚನೆಗಳು', bn: 'বিজ্ঞপ্তি', mr: 'सूচना' },
     'nav.settings': { en: 'Settings', hi: 'सेटिंग्स', ta: 'அமைப்புகள்', kn: 'ಸೆಟ್ಟಿಂಗ್‌ಗಳು', bn: 'সেটিংস', mr: 'सेटिंग्ज' },
     'nav.signOut': { en: 'Sign Out', hi: 'साइन आउट', ta: 'வெளியேறு', kn: 'ಸೈನ್ ಔಟ್', bn: 'সাইন আউট', mr: 'साइन आउट' },

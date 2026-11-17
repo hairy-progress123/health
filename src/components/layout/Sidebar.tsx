@@ -8,7 +8,7 @@ import { useLanguage } from '@/lib/LanguageProvider';
 import {
     LayoutDashboard, Brain, HeartPulse, FileText, Pill,
     Stethoscope, Users, Settings, Phone, LogOut, Menu,
-    Activity, ClipboardList, Bell, Atom
+    Activity, ClipboardList, Bell
 } from 'lucide-react';
 
 const navItems = [
@@ -22,7 +22,6 @@ const navItems = [
     { href: '/calls', tKey: 'nav.calls', icon: Phone },
     { href: '/recovery-circle', tKey: 'nav.recoveryCircle', icon: Users },
     { href: '/medicines', tKey: 'nav.medicines', icon: Pill },
-    { href: '/physics-lab', tKey: 'nav.physicsLab', icon: Atom },
     { href: '/notifications', tKey: 'nav.notifications', icon: Bell, showBadge: true },
     { href: '/settings', tKey: 'nav.settings', icon: Settings },
 ];
