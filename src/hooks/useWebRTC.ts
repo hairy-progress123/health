@@ -17,15 +17,12 @@ const FALLBACK: RTCConfiguration = {
     ],
 };
 
-let cached: RTCConfiguration | null = null;
 async function getIceConfig(): Promise<RTCConfiguration> {
-    if (cached) return cached;
     try {
-        const r = await fetch('/api/turn');
+        const r = await fetch('/api/turn', { cache: 'no-store' });
         if (r.ok) {
             const d = await r.json();
-            cached = { iceServers: d.iceServers, iceCandidatePoolSize: 10 };
-            return cached;
+            return { iceServers: d.iceServers, iceCandidatePoolSize: 10 };
         }
     } catch { /* fallback */ }
     return FALLBACK;
@@ -151,16 +148,31 @@ export function useWebRTC() {
         };
         pc.onconnectionstatechange = () => {
             const s = pc.connectionState;
-            if (mountedRef.current) setIsConnected(s === 'connected');
+            console.log('[WebRTC] connectionState:', s);
+            if (mountedRef.current) {
+                if (s === 'connected') {
+                    setIsConnected(true);
+                } else if (s === 'disconnected' || s === 'failed') {
+                    // Only drop connected flag if both connectionState and iceConnectionState are not connected
+                    if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') {
+                        setIsConnected(false);
+                    }
+                }
+            }
             if (s === 'failed') {
                 console.warn('[WebRTC] Connection FAILED — restarting ICE');
-                pc.restartIce();
+                try { pc.restartIce(); } catch { }
             }
         };
         pc.oniceconnectionstatechange = () => {
             const s = pc.iceConnectionState;
-            if (s === 'connected' || s === 'completed') {
-                if (mountedRef.current) setIsConnected(true);
+            console.log('[WebRTC] iceConnectionState:', s);
+            if (mountedRef.current) {
+                if (s === 'connected' || s === 'completed') {
+                    setIsConnected(true);
+                } else if (s === 'failed') {
+                    setIsConnected(false);
+                }
             }
         };
         return pc;
@@ -252,12 +264,14 @@ export function useWebRTC() {
                 }
             }
 
-            // Stop polling after connected + all candidates received
-            if (answerApplied && p.iceConnectionState === 'connected') {
-                // Keep polling a bit for late candidates, then stop
+            // Don't stop polling too early, keep polling for late candidates
+            if (answerApplied && (p.iceConnectionState === 'connected' || p.iceConnectionState === 'completed')) {
                 setTimeout(() => {
-                    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-                }, 5000);
+                    if (pollRef.current && (p.iceConnectionState === 'connected' || p.iceConnectionState === 'completed')) {
+                        clearInterval(pollRef.current);
+                        pollRef.current = null;
+                    }
+                }, 10000);
             }
         }, 500);
 
@@ -321,11 +335,11 @@ export function useWebRTC() {
         // Flush ICE candidates after short delay
         setTimeout(() => icePusher.flush(), 500);
 
-        // Poll for new caller ICE candidates (500ms, up to 15 seconds)
+        // Poll for new caller ICE candidates (500ms, up to 30 seconds)
         let pollCount = 0;
         pollRef.current = setInterval(async () => {
             pollCount++;
-            if (!mountedRef.current || !pcRef.current || pollCount > 30) {
+            if (!mountedRef.current || !pcRef.current || pollCount > 60) {
                 if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
                 return;
             }

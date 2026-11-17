@@ -226,22 +226,37 @@ export default function UserCallsPage() {
                             display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 24,
                         }}>
                         {/* Remote Video (full screen background) */}
-                        {activeCall.type === 'video' && webrtc.remoteStream && (
+                        {activeCall.type === 'video' && (
                             <video
-                                ref={el => { if (el && el.srcObject !== webrtc.remoteStream) el.srcObject = webrtc.remoteStream; }}
+                                ref={el => {
+                                    if (el && webrtc.remoteStream && el.srcObject !== webrtc.remoteStream) {
+                                        el.srcObject = webrtc.remoteStream;
+                                        el.play().catch(() => {});
+                                    }
+                                }}
                                 autoPlay playsInline
-                                style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }}
+                                style={{
+                                    position: 'absolute', inset: 0, width: '100%', height: '100%',
+                                    objectFit: 'cover',
+                                    display: webrtc.remoteStream ? 'block' : 'none',
+                                }}
                             />
                         )}
                         {/* Local Video (small pip) */}
-                        {activeCall.type === 'video' && webrtc.localStream && (
+                        {activeCall.type === 'video' && (
                             <video
-                                ref={el => { if (el && el.srcObject !== webrtc.localStream) el.srcObject = webrtc.localStream; }}
+                                ref={el => {
+                                    if (el && webrtc.localStream && el.srcObject !== webrtc.localStream) {
+                                        el.srcObject = webrtc.localStream;
+                                        el.play().catch(() => {});
+                                    }
+                                }}
                                 autoPlay playsInline muted
                                 style={{
-                                    position: 'absolute', bottom: 100, right: 20, width: 120, height: 160,
-                                    borderRadius: 12, objectFit: 'cover', border: '2px solid rgba(255,255,255,0.3)',
+                                    position: 'absolute', bottom: 100, right: 20, width: 130, height: 180,
+                                    borderRadius: 14, objectFit: 'cover', border: '2px solid rgba(255,255,255,0.4)',
                                     zIndex: 10, background: '#000',
+                                    display: webrtc.localStream ? 'block' : 'none',
                                 }}
                             />
                         )}
