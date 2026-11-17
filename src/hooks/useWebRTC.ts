@@ -141,9 +141,15 @@ export function useWebRTC() {
         stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
         pc.ontrack = (e) => {
+            console.log('[WebRTC] ontrack received:', e.track.kind, e.streams);
             if (mountedRef.current) {
                 const rs = e.streams[0] || new MediaStream([e.track]);
                 setRemoteStream(rs);
+                // Also unmute audio if browser suspended it
+                if (e.track.kind === 'audio' && audioRef.current) {
+                    audioRef.current.srcObject = rs;
+                    audioRef.current.play().catch(err => console.log('Audio autoplay blocked:', err));
+                }
             }
         };
         pc.onconnectionstatechange = () => {

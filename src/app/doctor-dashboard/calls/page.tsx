@@ -345,28 +345,34 @@ export default function CallsPage() {
                             </motion.div>
                         )}
 
-                        <div style={{
-                            width: 100, height: 100, borderRadius: '50%', background: 'var(--gradient-primary)',
-                            display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 40, color: 'white', fontWeight: 700,
-                        }}>
-                            {activeCall.userName.charAt(0)}
-                        </div>
-                        <h2 style={{ fontSize: 24, fontWeight: 700, color: 'white' }}>{activeCall.userName}</h2>
-                        <p style={{ color: 'rgba(255,255,255,0.6)', fontSize: 14 }}>
+                        {/* Patient info & Avatar (shown in Audio call OR while remote video is connecting) */}
+                        {(!webrtc.remoteStream || callType === 'audio') && (
+                            <>
+                                <div style={{
+                                    width: 100, height: 100, borderRadius: '50%', background: 'var(--gradient-primary)',
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 40, color: 'white', fontWeight: 700,
+                                    zIndex: 2,
+                                }}>
+                                    {activeCall.userName.charAt(0)}
+                                </div>
+                                <h2 style={{ fontSize: 24, fontWeight: 700, color: 'white', zIndex: 2 }}>{activeCall.userName}</h2>
+                            </>
+                        )}
+                        <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: 14, zIndex: 2, textShadow: '0 1px 4px rgba(0,0,0,0.8)' }}>
                             {activeCall.status === 'ringing' ? 'Ringing... waiting for patient to accept' : formatDuration(callDuration)}
                         </p>
                         {/* Permission error */}
                         {webrtc.permissionError && (
-                            <div style={{ padding: '8px 16px', borderRadius: 8, background: 'rgba(239,68,68,0.2)', border: '1px solid rgba(239,68,68,0.3)', color: '#FCA5A5', fontSize: 12, maxWidth: 300, textAlign: 'center' }}>
+                            <div style={{ padding: '8px 16px', borderRadius: 8, background: 'rgba(239,68,68,0.2)', border: '1px solid rgba(239,68,68,0.3)', color: '#FCA5A5', fontSize: 12, maxWidth: 300, textAlign: 'center', zIndex: 2 }}>
                                 {webrtc.permissionError}
                             </div>
                         )}
                         {/* Connection status */}
                         {activeCall.status === 'ongoing' && (
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, zIndex: 2, background: 'rgba(0,0,0,0.5)', padding: '4px 12px', borderRadius: 20 }}>
                                 <div style={{ width: 8, height: 8, borderRadius: '50%', background: webrtc.isConnected ? '#10B981' : '#F59E0B' }} />
                                 <span style={{ color: webrtc.isConnected ? '#10B981' : '#F59E0B', fontSize: 11, fontWeight: 600 }}>
-                                    {webrtc.isConnected ? 'Voice Connected' : 'Connecting...'}
+                                    {webrtc.isConnected ? 'Connected' : 'Connecting...'}
                                 </span>
                             </div>
                         )}

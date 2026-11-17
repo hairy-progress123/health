@@ -272,25 +272,33 @@ export default function UserCallsPage() {
                                 color: '#10B981', fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6,
                             }}><Monitor size={14} /> Screen Sharing Active</div>
                         )}
-                        <div style={{
-                            width: 100, height: 100, borderRadius: '50%', background: 'var(--gradient-primary)',
-                            display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 40, color: 'white', fontWeight: 700,
-                        }}>
-                            {activeCall.doctorName.split(' ').pop()?.charAt(0) || 'D'}
-                        </div>
-                        <h2 style={{ fontSize: 24, fontWeight: 700, color: 'white' }}>{activeCall.doctorName}</h2>
-                        <p style={{ color: 'rgba(255,255,255,0.6)', fontSize: 14 }}>{formatDuration(callDuration)}</p>
+                        {/* Patient info & Avatar (shown in Audio call OR while remote video is connecting) */}
+                        {(!webrtc.remoteStream || activeCall.type === 'audio') && (
+                            <>
+                                <div style={{
+                                    width: 100, height: 100, borderRadius: '50%', background: 'var(--gradient-primary)',
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 40, color: 'white', fontWeight: 700,
+                                    zIndex: 2,
+                                }}>
+                                    {activeCall.doctorName.split(' ').pop()?.charAt(0) || 'D'}
+                                </div>
+                                <h2 style={{ fontSize: 24, fontWeight: 700, color: 'white', zIndex: 2 }}>{activeCall.doctorName}</h2>
+                            </>
+                        )}
+                        <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: 14, zIndex: 2, textShadow: '0 1px 4px rgba(0,0,0,0.8)' }}>
+                            {formatDuration(callDuration)}
+                        </p>
                         {/* Permission error */}
                         {webrtc.permissionError && (
-                            <div style={{ padding: '8px 16px', borderRadius: 8, background: 'rgba(239,68,68,0.2)', border: '1px solid rgba(239,68,68,0.3)', color: '#FCA5A5', fontSize: 12, maxWidth: 300, textAlign: 'center' }}>
+                            <div style={{ padding: '8px 16px', borderRadius: 8, background: 'rgba(239,68,68,0.2)', border: '1px solid rgba(239,68,68,0.3)', color: '#FCA5A5', fontSize: 12, maxWidth: 300, textAlign: 'center', zIndex: 2 }}>
                                 {webrtc.permissionError}
                             </div>
                         )}
                         {/* Connection status */}
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, zIndex: 2, background: 'rgba(0,0,0,0.5)', padding: '4px 12px', borderRadius: 20 }}>
                             <div style={{ width: 8, height: 8, borderRadius: '50%', background: webrtc.isConnected ? '#10B981' : '#F59E0B' }} />
                             <span style={{ color: webrtc.isConnected ? '#10B981' : '#F59E0B', fontSize: 11, fontWeight: 600 }}>
-                                {webrtc.isConnected ? 'Voice Connected' : 'Connecting...'}
+                                {webrtc.isConnected ? 'Connected' : 'Connecting...'}
                             </span>
                         </div>
                         <div style={{ display: 'flex', gap: 16, marginTop: 20, position: 'relative', zIndex: 10000 }}>
