@@ -44,8 +44,24 @@ export default function UserCallsPage() {
                 const call = await cloudGetActiveCall();
                 if (!isMounted) return;
                 if (call && call.userId === userId && (call.status === 'ringing' || call.status === 'ongoing')) {
-                    setActiveCall(call);
+                    // If we weren't in a call, or call id changed, set it
+                    setActiveCall(prev => {
+                        if (!prev || prev.id !== call.id) return call;
+                        // Keep previous reference if status didn't change
+                        if (prev.status !== call.status) return call;
+                        return prev;
+                    });
+
+                    // If call is already ongoing and we haven't started WebRTC callee yet
+                    if (call.status === 'ongoing' && !webrtc.isConnected && !webrtc.localStream) {
+                        try {
+                            webrtc.startAsCalleeAsync(call.id, call.type || 'audio');
+                        } catch (err) {
+                            console.error('Auto-start callee WebRTC failed:', err);
+                        }
+                    }
                 } else if (activeCallRef.current && call === null) {
+                    webrtc.stopCall();
                     setActiveCall(null);
                     setCallDuration(0);
                     const history = await cloudGetCallLogs(userId, 'user');
@@ -54,7 +70,7 @@ export default function UserCallsPage() {
             } catch {
                 // Ignore transient network errors
             }
-        }, 4000);
+        }, 1500);
         return () => {
             isMounted = false;
             clearInterval(interval);

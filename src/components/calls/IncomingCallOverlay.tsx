@@ -27,13 +27,13 @@ export default function IncomingCallOverlay() {
                 if (!isMounted) return;
                 if (call && call.userId === userId && call.status === 'ringing') {
                     setActiveCall(call);
-                } else {
+                } else if (!call || call.status !== 'ringing') {
                     setActiveCall(null);
                 }
             } catch {
                 // Ignore transient network errors
             }
-        }, 5000);
+        }, 2000);
         return () => {
             isMounted = false;
             clearInterval(interval);
@@ -49,7 +49,6 @@ export default function IncomingCallOverlay() {
             message: `Connected with ${activeCall.doctorName}`,
             timestamp: new Date().toISOString(), read: false,
         });
-        setActiveCall(null);
         if (pathname !== '/calls') router.push('/calls');
     };
 
