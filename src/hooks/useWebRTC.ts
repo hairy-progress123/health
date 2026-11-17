@@ -68,32 +68,55 @@ async function sigGet<T>(key: string): Promise<T | null> {
     try { return await cloudGet<T>(key); } catch { return null; }
 }
 
-// ── Media helper ────────────────────────────────────────────
+// ── Media helper with tiered camera fallback ─────────────────
 
 async function getMedia(type: 'audio' | 'video'): Promise<MediaStream> {
-    try {
-        return await navigator.mediaDevices.getUserMedia({
-            audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-            video: type === 'video'
-                ? { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }
-                : false,
-        });
-    } catch (err: unknown) {
-        const e = err as Error;
-        if (type === 'video' && e.name === 'NotFoundError') {
+    if (type === 'video') {
+        // 1. Try with user-facing constraints
+        try {
+            return await navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+                video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+            });
+        } catch (e1) {
+            console.warn('[WebRTC] getMedia with video constraints failed, trying basic video: true', e1);
+            // 2. Try with basic video: true (bypasses device-specific constraint issues)
             try {
-                // Fallback to audio-only if webcam hardware is missing
                 return await navigator.mediaDevices.getUserMedia({
                     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-                    video: false,
+                    video: true,
                 });
-            } catch { /* proceed to throw */ }
+            } catch (e2) {
+                console.warn('[WebRTC] Camera unavailable or in use by another tab/app, falling back to audio-only stream', e2);
+                // 3. Fallback to audio-only stream so call connects and can still receive remote video
+                try {
+                    return await navigator.mediaDevices.getUserMedia({
+                        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+                        video: false,
+                    });
+                } catch (e3: unknown) {
+                    const err = e3 as Error;
+                    if (err.name === 'NotAllowedError') {
+                        throw new Error('Please allow microphone access in your browser settings');
+                    }
+                    throw new Error('Could not access microphone: ' + err.message);
+                }
+            }
         }
-        if (e.name === 'NotAllowedError')
-            throw new Error('Please allow ' + (type === 'video' ? 'camera and microphone' : 'microphone') + ' access in your browser settings');
-        if (e.name === 'NotFoundError')
-            throw new Error('No ' + (type === 'video' ? 'camera/' : '') + 'microphone found on this device');
-        throw new Error('Could not access media: ' + e.message);
+    } else {
+        // Audio only
+        try {
+            return await navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+                video: false,
+            });
+        } catch (err: unknown) {
+            const e = err as Error;
+            if (e.name === 'NotAllowedError') {
+                throw new Error('Please allow microphone access in your browser settings');
+            }
+            throw new Error('Could not access microphone: ' + e.message);
+        }
     }
 }
 
@@ -197,30 +220,41 @@ export function useWebRTC() {
         remoteMediaStreamRef.current = streamContainer;
 
         pc.ontrack = (e) => {
-            console.log('[WebRTC] ontrack received:', e.track.kind, e.track.id);
+            console.log('[WebRTC] ontrack received:', e.track.kind, e.track.id, e.streams);
             if (!mountedRef.current) return;
 
             // Mark connected since media is arriving
             setIsConnected(true);
 
-            // Accumulate track if not already in container
-            if (!streamContainer.getTracks().some(t => t.id === e.track.id)) {
-                streamContainer.addTrack(e.track);
+            // If browser passed an active MediaStream in e.streams[0], adopt it directly
+            if (e.streams && e.streams[0]) {
+                const liveStream = e.streams[0];
+                remoteMediaStreamRef.current = liveStream;
+                setRemoteStream(liveStream);
+
+                liveStream.onaddtrack = () => {
+                    if (mountedRef.current) {
+                        setRemoteStream(new MediaStream(liveStream.getTracks()));
+                    }
+                };
+            } else {
+                if (!streamContainer.getTracks().some(t => t.id === e.track.id)) {
+                    streamContainer.addTrack(e.track);
+                }
+                const newStream = new MediaStream(streamContainer.getTracks());
+                remoteMediaStreamRef.current = newStream;
+                setRemoteStream(newStream);
             }
 
-            // Provide new MediaStream instance so React components re-render with updated tracks
-            const newStream = new MediaStream(streamContainer.getTracks());
-            setRemoteStream(newStream);
-
             if (e.track.kind === 'audio' && audioRef.current) {
-                audioRef.current.srcObject = newStream;
+                audioRef.current.srcObject = remoteMediaStreamRef.current;
                 audioRef.current.play().catch(err => console.log('Audio autoplay blocked:', err));
             }
 
             e.track.onunmute = () => {
                 console.log('[WebRTC] track onunmute:', e.track.kind);
-                if (mountedRef.current) {
-                    setRemoteStream(new MediaStream(streamContainer.getTracks()));
+                if (mountedRef.current && remoteMediaStreamRef.current) {
+                    setRemoteStream(new MediaStream(remoteMediaStreamRef.current.getTracks()));
                     if (e.track.kind === 'audio' && audioRef.current) {
                         audioRef.current.play().catch(() => { });
                     }
@@ -323,7 +357,7 @@ export function useWebRTC() {
         }
     };
 
-    // ═══════════ CALLER (Doctor) ═══════════
+    // ═══════════ CALLER (Doctor or Patient Initiator) ═══════════
     const startAsCallerAsync = useCallback(async (callId: string, callType: 'audio' | 'video' = 'audio') => {
         if (activeCallIdRef.current === callId && (isStartingRef.current || pcRef.current)) {
             console.log('[WebRTC] Caller already initialized for call', callId);
@@ -346,6 +380,17 @@ export function useWebRTC() {
             setLocalStream(stream);
 
             const pc = setupPC(config, stream);
+
+            // In Caller: ensure video transceiver direction is set
+            if (callType === 'video') {
+                const hasVideo = stream.getVideoTracks().length > 0;
+                const existing = pc.getTransceivers().find(t => t.receiver.track.kind === 'video');
+                if (existing) {
+                    existing.direction = 'sendrecv';
+                } else if (!hasVideo) {
+                    pc.addTransceiver('video', { direction: 'recvonly' });
+                }
+            }
 
             // ICE candidate pusher → writes to caller ICE key
             const icePusher = createIcePusher(KEY.callerIce(callId));
@@ -407,7 +452,7 @@ export function useWebRTC() {
         }
     }, [cleanup]);
 
-    // ═══════════ CALLEE (Patient) ═══════════
+    // ═══════════ CALLEE (Receiver) ═══════════
     const startAsCalleeAsync = useCallback(async (callId: string, callType: 'audio' | 'video' = 'audio') => {
         if (activeCallIdRef.current === callId && (isStartingRef.current || pcRef.current)) {
             console.log('[WebRTC] Callee already initialized for call', callId);
@@ -462,7 +507,17 @@ export function useWebRTC() {
                 sdp: offerData.sdp,
             }));
 
-            // 2. Create and set local answer
+            // 2. Configure video transceiver direction
+            if (callType === 'video') {
+                const transceivers = pc.getTransceivers();
+                const videoTransceiver = transceivers.find(t => t.receiver.track.kind === 'video');
+                if (videoTransceiver) {
+                    const hasLocalVideo = stream.getVideoTracks().length > 0;
+                    videoTransceiver.direction = hasLocalVideo ? 'sendrecv' : 'recvonly';
+                }
+            }
+
+            // 3. Create and set local answer
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             await sigSet(KEY.answer(callId), { type: answer.type, sdp: answer.sdp || '' });
@@ -470,14 +525,14 @@ export function useWebRTC() {
             isStartingRef.current = false;
             icePusher.flush();
 
-            // 3. Now that BOTH descriptions are set, safely apply any Caller ICE candidates
+            // 4. Now that BOTH descriptions are set, safely apply any Caller ICE candidates
             const appliedCallerIce = new Set<string>();
             const initialCallerIce = await sigGet<IceEntry[]>(KEY.callerIce(callId));
             if (initialCallerIce && initialCallerIce.length > 0) {
                 await applyIceCandidates(pc, initialCallerIce, appliedCallerIce);
             }
 
-            // 4. Poll for additional Caller ICE candidates (500ms interval)
+            // 5. Poll for additional Caller ICE candidates (500ms interval)
             pollRef.current = setInterval(async () => {
                 if (!mountedRef.current || !pcRef.current || pcRef.current.connectionState === 'closed') {
                     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }

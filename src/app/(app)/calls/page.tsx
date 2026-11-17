@@ -4,12 +4,19 @@ import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
     Phone, Video, PhoneOff, PhoneIncoming, Mic, MicOff, Camera, CameraOff, Clock,
-    Monitor, MonitorOff, PhoneCall, PhoneMissed
+    Monitor, MonitorOff, PhoneCall, PhoneMissed, User, X
 } from 'lucide-react';
 import { getCurrentUser, generateId, type CallLog } from '@/lib/store';
-import { cloudGetCallLogs, cloudGetActiveCall, cloudUpdateCallLog, cloudAddNotification } from '@/lib/shared-store';
+import { cloudGetCallLogs, cloudGetActiveCall, cloudUpdateCallLog, cloudAddCallLog, cloudAddNotification } from '@/lib/shared-store';
 import { useLanguage } from '@/lib/LanguageProvider';
 import { useWebRTC } from '@/hooks/useWebRTC';
+
+const DOCTORS = [
+    { id: 'doc1', name: 'Dr. Priya Sharma', specialty: 'Nephrologist', initials: 'PS' },
+    { id: 'doc2', name: 'Dr. Rajesh Kumar', specialty: 'Cardiologist', initials: 'RK' },
+    { id: 'doc3', name: 'Dr. Ananya Patel', specialty: 'General Physician', initials: 'AP' },
+    { id: 'doc4', name: 'Dr. Suresh Reddy', specialty: 'Orthopedic', initials: 'SR' },
+];
 
 export default function UserCallsPage() {
     const { t } = useLanguage();
@@ -21,15 +28,54 @@ export default function UserCallsPage() {
     const [isCamOff, setIsCamOff] = useState(false);
     const [isScreenShare, setIsScreenShare] = useState(false);
     const [callDuration, setCallDuration] = useState(0);
+    const [showDialer, setShowDialer] = useState(false);
+    const [selectedDoc, setSelectedDoc] = useState('doc1');
 
     const activeCallRef = useRef<CallLog | null>(null);
     const callDurationRef = useRef(0);
     const userIdRef = useRef('');
     const startingCallIdRef = useRef<string | null>(null);
+    const isCallerRef = useRef(false);
+
+    const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+    const localVideoRef = useRef<HTMLVideoElement | null>(null);
 
     useEffect(() => { activeCallRef.current = activeCall; }, [activeCall]);
     useEffect(() => { callDurationRef.current = callDuration; }, [callDuration]);
     useEffect(() => { userIdRef.current = userId; }, [userId]);
+
+    // Attach & play remote video when stream updates
+    useEffect(() => {
+        const video = remoteVideoRef.current;
+        if (!video || !webrtc.remoteStream) return;
+
+        if (video.srcObject !== webrtc.remoteStream) {
+            video.srcObject = webrtc.remoteStream;
+        }
+
+        const tryPlay = () => {
+            video.play().catch(() => {
+                video.muted = true;
+                video.play().catch(() => {});
+            });
+        };
+
+        tryPlay();
+        video.onloadedmetadata = () => { tryPlay(); };
+    }, [webrtc.remoteStream]);
+
+    // Attach & play local video when stream updates
+    useEffect(() => {
+        const video = localVideoRef.current;
+        if (!video || !webrtc.localStream) return;
+
+        if (video.srcObject !== webrtc.localStream) {
+            video.srcObject = webrtc.localStream;
+        }
+        video.muted = true;
+        video.play().catch(() => {});
+        video.onloadedmetadata = () => { video.play().catch(() => {}); };
+    }, [webrtc.localStream]);
 
     useEffect(() => {
         const user = getCurrentUser();
@@ -38,6 +84,7 @@ export default function UserCallsPage() {
         cloudGetCallLogs(user.id, 'user').then(setCallHistory);
     }, []);
 
+    // Status polling interval
     useEffect(() => {
         if (!userId) return;
         let isMounted = true;
@@ -46,15 +93,14 @@ export default function UserCallsPage() {
                 const call = await cloudGetActiveCall();
                 if (!isMounted) return;
                 if (call && call.userId === userId && (call.status === 'ringing' || call.status === 'ongoing')) {
-                    // Update activeCall if call id changed or status changed
                     setActiveCall(prev => {
                         if (!prev || prev.id !== call.id) return call;
                         if (prev.status !== call.status) return call;
                         return prev;
                     });
 
-                    // If call is ongoing and we haven't started WebRTC callee yet for this call
-                    if (call.status === 'ongoing') {
+                    // Callee auto-start: If call is ongoing and we are the receiver (not caller)
+                    if (call.status === 'ongoing' && !isCallerRef.current) {
                         if (startingCallIdRef.current !== call.id) {
                             startingCallIdRef.current = call.id;
                             try {
@@ -66,6 +112,7 @@ export default function UserCallsPage() {
                     }
                 } else if (activeCallRef.current && call === null) {
                     startingCallIdRef.current = null;
+                    isCallerRef.current = false;
                     webrtc.stopCall();
                     setActiveCall(null);
                     setCallDuration(0);
@@ -82,20 +129,52 @@ export default function UserCallsPage() {
         };
     }, [userId]);
 
+    // Timer
     useEffect(() => {
         if (!activeCall || activeCall.status !== 'ongoing' || !webrtc.isConnected) return;
         const interval = setInterval(() => setCallDuration(d => d + 1), 1000);
         return () => clearInterval(interval);
     }, [activeCall?.status, webrtc.isConnected]);
 
+    // Start a call from patient to doctor
+    const startCallAsPatient = async (type: 'audio' | 'video') => {
+        if (!selectedDoc || !userId) return;
+        const doc = DOCTORS.find(d => d.id === selectedDoc) || DOCTORS[0];
+        const user = getCurrentUser();
+        const call: CallLog = {
+            id: generateId(),
+            doctorId: doc.id,
+            doctorName: doc.name,
+            userId,
+            userName: user?.name || 'Patient',
+            type,
+            status: 'ringing',
+            startTime: new Date().toISOString(),
+        };
+
+        isCallerRef.current = true;
+        startingCallIdRef.current = call.id;
+        await cloudAddCallLog(call);
+        setActiveCall(call);
+        setCallDuration(0);
+        setShowDialer(false);
+
+        try {
+            await webrtc.startAsCallerAsync(call.id, type);
+        } catch (e) {
+            console.error('Patient startAsCallerAsync failed:', e);
+        }
+    };
+
+    // Accept an incoming call from doctor
     const acceptCall = async () => {
         if (!activeCall) return;
+        isCallerRef.current = false;
         startingCallIdRef.current = activeCall.id;
         await cloudUpdateCallLog(activeCall.id, { status: 'ongoing' });
         setActiveCall(prev => prev ? { ...prev, status: 'ongoing' } : null);
         setCallDuration(0);
 
-        // Start WebRTC as callee — create SDP answer from doctor's offer
         try {
             await webrtc.startAsCalleeAsync(activeCall.id, activeCall.type || 'audio');
         } catch (e) {
@@ -113,6 +192,7 @@ export default function UserCallsPage() {
     const rejectCall = async () => {
         if (!activeCall) return;
         startingCallIdRef.current = null;
+        isCallerRef.current = false;
         webrtc.stopCall();
         await cloudUpdateCallLog(activeCall.id, { status: 'missed', endTime: new Date().toISOString() });
         await cloudAddNotification({
@@ -130,6 +210,7 @@ export default function UserCallsPage() {
         const call = activeCallRef.current;
         if (!call) return;
         startingCallIdRef.current = null;
+        isCallerRef.current = false;
         webrtc.stopCall();
         await cloudUpdateCallLog(call.id, { status: 'completed', endTime: new Date().toISOString(), duration: callDurationRef.current });
         await cloudAddNotification({
@@ -155,10 +236,75 @@ export default function UserCallsPage() {
     const missedCalls = callHistory.filter(c => c.status === 'missed').length;
     const totalDuration = callHistory.reduce((sum, c) => sum + (c.duration || 0), 0);
 
+    const hasRemoteVideo = webrtc.remoteStream && webrtc.remoteStream.getVideoTracks().length > 0;
+    const hasLocalVideo = webrtc.localStream && webrtc.localStream.getVideoTracks().length > 0;
+
     return (
         <div style={{ maxWidth: 900, margin: '0 auto' }}>
-            <h1 style={{ fontSize: 26, fontWeight: 800, marginBottom: 6 }}>{t('calls.title')}</h1>
-            <p style={{ color: 'var(--text-secondary)', fontSize: 14, marginBottom: 24 }}>{t('calls.subtitle')}</p>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+                <div>
+                    <h1 style={{ fontSize: 26, fontWeight: 800 }}>{t('calls.title')}</h1>
+                    <p style={{ color: 'var(--text-secondary)', fontSize: 14, marginTop: 4 }}>{t('calls.subtitle')}</p>
+                </div>
+                {!activeCall && (
+                    <button className="btn-primary" onClick={() => setShowDialer(true)} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '10px 20px' }}>
+                        <Phone size={16} /> Call Doctor
+                    </button>
+                )}
+            </div>
+
+            {/* New Call / Call Doctor Modal */}
+            <AnimatePresence>
+                {showDialer && !activeCall && (
+                    <div style={{
+                        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        zIndex: 1001, padding: 20, backdropFilter: 'blur(6px)',
+                    }}>
+                        <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }}
+                            className="glass-card-static" style={{ padding: 28, width: '100%', maxWidth: 440 }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+                                <h2 style={{ fontSize: 18, fontWeight: 700 }}>Call Doctor</h2>
+                                <button onClick={() => setShowDialer(false)} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer' }}>
+                                    <X size={18} />
+                                </button>
+                            </div>
+
+                            <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 8 }}>Select Doctor</label>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 24 }}>
+                                {DOCTORS.map(doc => (
+                                    <div key={doc.id} onClick={() => setSelectedDoc(doc.id)} style={{
+                                        display: 'flex', alignItems: 'center', gap: 12, padding: 12, borderRadius: 12,
+                                        border: `1.5px solid ${selectedDoc === doc.id ? 'var(--color-primary)' : 'rgba(255,255,255,0.08)'}`,
+                                        background: selectedDoc === doc.id ? 'rgba(14,165,233,0.1)' : 'rgba(255,255,255,0.02)',
+                                        cursor: 'pointer', transition: 'all 0.2s',
+                                    }}>
+                                        <div style={{
+                                            width: 40, height: 40, borderRadius: 10, background: 'var(--gradient-primary)',
+                                            display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white', fontWeight: 700, fontSize: 14,
+                                        }}>
+                                            {doc.initials}
+                                        </div>
+                                        <div style={{ flex: 1 }}>
+                                            <div style={{ fontWeight: 600, fontSize: 14 }}>{doc.name}</div>
+                                            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{doc.specialty}</div>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                                <button className="btn-secondary" onClick={() => startCallAsPatient('audio')} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, padding: 12 }}>
+                                    <Phone size={16} style={{ color: '#0EA5E9' }} /> Audio Call
+                                </button>
+                                <button className="btn-primary" onClick={() => startCallAsPatient('video')} style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, padding: 12 }}>
+                                    <Video size={16} /> Video Call
+                                </button>
+                            </div>
+                        </motion.div>
+                    </div>
+                )}
+            </AnimatePresence>
 
             {totalCalls > 0 && (
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 24 }}>
@@ -179,7 +325,7 @@ export default function UserCallsPage() {
 
             {/* Incoming Call Overlay */}
             <AnimatePresence>
-                {activeCall && activeCall.status === 'ringing' && (
+                {activeCall && activeCall.status === 'ringing' && !isCallerRef.current && (
                     <motion.div initial={{ opacity: 0, y: -30 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -30 }}
                         transition={{ type: 'spring', damping: 20, stiffness: 300 }}
                         style={{
@@ -228,9 +374,9 @@ export default function UserCallsPage() {
                 )}
             </AnimatePresence>
 
-            {/* Ongoing Call Screen */}
+            {/* Active / Ongoing Call Screen */}
             <AnimatePresence>
-                {activeCall && activeCall.status === 'ongoing' && (
+                {activeCall && (activeCall.status === 'ongoing' || (activeCall.status === 'ringing' && isCallerRef.current)) && (
                     <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }}
                         style={{
                             position: 'fixed', inset: 0, zIndex: 9999,
@@ -253,21 +399,15 @@ export default function UserCallsPage() {
                         {/* Remote Video (doctor's video in video call) */}
                         {activeCall.type === 'video' && (
                             <video
-                                ref={el => {
-                                    if (el && webrtc.remoteStream && el.srcObject !== webrtc.remoteStream) {
-                                        el.srcObject = webrtc.remoteStream;
-                                        el.play().catch(() => {
-                                            el.muted = true;
-                                            el.play().catch(() => {});
-                                        });
-                                    }
-                                }}
+                                ref={remoteVideoRef}
                                 autoPlay
                                 playsInline
                                 style={{
                                     position: 'absolute', inset: 0, width: '100%', height: '100%',
                                     objectFit: 'cover',
-                                    display: (webrtc.remoteStream && webrtc.remoteStream.getVideoTracks().length > 0) ? 'block' : 'none',
+                                    opacity: hasRemoteVideo ? 1 : 0,
+                                    transition: 'opacity 0.4s ease',
+                                    zIndex: 1,
                                 }}
                             />
                         )}
@@ -275,12 +415,7 @@ export default function UserCallsPage() {
                         {/* Local Video (patient's picture-in-picture) */}
                         {activeCall.type === 'video' && (
                             <video
-                                ref={el => {
-                                    if (el && webrtc.localStream && el.srcObject !== webrtc.localStream) {
-                                        el.srcObject = webrtc.localStream;
-                                        el.play().catch(() => {});
-                                    }
-                                }}
+                                ref={localVideoRef}
                                 autoPlay
                                 playsInline
                                 muted
@@ -288,27 +423,14 @@ export default function UserCallsPage() {
                                     position: 'absolute', bottom: 100, right: 20, width: 130, height: 180,
                                     borderRadius: 14, objectFit: 'cover', border: '2px solid rgba(255,255,255,0.4)',
                                     zIndex: 10, background: '#000',
-                                    display: (webrtc.localStream && webrtc.localStream.getVideoTracks().length > 0) ? 'block' : 'none',
+                                    opacity: hasLocalVideo ? 1 : 0,
+                                    display: hasLocalVideo ? 'block' : 'none',
                                 }}
                             />
                         )}
 
-                        {activeCall.type === 'video' && (!webrtc.remoteStream || webrtc.remoteStream.getVideoTracks().length === 0) && (
-                            <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: 0.1 }}>
-                                <Video size={200} />
-                            </div>
-                        )}
-
-                        {isScreenShare && (
-                            <div style={{
-                                position: 'absolute', top: 20, left: 20, padding: '8px 16px', borderRadius: 10,
-                                background: 'rgba(16,185,129,0.2)', border: '1px solid rgba(16,185,129,0.3)',
-                                color: '#10B981', fontSize: 13, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6,
-                            }}><Monitor size={14} /> Screen Sharing Active</div>
-                        )}
-
                         {/* Doctor info & Avatar (shown in Audio call OR while remote video track is not yet active) */}
-                        {(activeCall.type === 'audio' || !webrtc.remoteStream || webrtc.remoteStream.getVideoTracks().length === 0) && (
+                        {(activeCall.type === 'audio' || !hasRemoteVideo) && (
                             <>
                                 <div style={{
                                     width: 100, height: 100, borderRadius: '50%', background: 'var(--gradient-primary)',
@@ -322,7 +444,7 @@ export default function UserCallsPage() {
                         )}
 
                         <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: 14, zIndex: 2, textShadow: '0 1px 4px rgba(0,0,0,0.8)' }}>
-                            {formatDuration(callDuration)}
+                            {activeCall.status === 'ringing' ? 'Calling doctor... waiting for answer' : formatDuration(callDuration)}
                         </p>
 
                         {/* Permission error */}
@@ -333,12 +455,14 @@ export default function UserCallsPage() {
                         )}
 
                         {/* Connection status */}
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, zIndex: 2, background: 'rgba(0,0,0,0.5)', padding: '4px 12px', borderRadius: 20 }}>
-                            <div style={{ width: 8, height: 8, borderRadius: '50%', background: webrtc.isConnected ? '#10B981' : '#F59E0B' }} />
-                            <span style={{ color: webrtc.isConnected ? '#10B981' : '#F59E0B', fontSize: 11, fontWeight: 600 }}>
-                                {webrtc.isConnected ? 'Connected' : 'Connecting...'}
-                            </span>
-                        </div>
+                        {activeCall.status === 'ongoing' && (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, zIndex: 2, background: 'rgba(0,0,0,0.5)', padding: '4px 12px', borderRadius: 20 }}>
+                                <div style={{ width: 8, height: 8, borderRadius: '50%', background: webrtc.isConnected ? '#10B981' : '#F59E0B' }} />
+                                <span style={{ color: webrtc.isConnected ? '#10B981' : '#F59E0B', fontSize: 11, fontWeight: 600 }}>
+                                    {webrtc.isConnected ? 'Connected' : 'Connecting...'}
+                                </span>
+                            </div>
+                        )}
 
                         {/* Call Action Controls */}
                         <div style={{ display: 'flex', gap: 16, marginTop: 20, position: 'relative', zIndex: 10000 }}>
@@ -385,7 +509,7 @@ export default function UserCallsPage() {
                 <div className="glass-card-static" style={{ padding: 60, textAlign: 'center' }}>
                     <Phone size={48} style={{ color: 'var(--text-muted)', marginBottom: 14, opacity: 0.3 }} />
                     <p style={{ color: 'var(--text-muted)', fontSize: 15 }}>{t('calls.noHistory')}</p>
-                    <p style={{ color: 'var(--text-muted)', fontSize: 12, marginTop: 4 }}>When your doctor calls you, it will appear here.</p>
+                    <p style={{ color: 'var(--text-muted)', fontSize: 12, marginTop: 4 }}>When your doctor calls you, or when you call your doctor, it will appear here.</p>
                 </div>
             ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>

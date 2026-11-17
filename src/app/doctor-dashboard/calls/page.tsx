@@ -50,10 +50,48 @@ export default function CallsPage() {
     const activeCallRef = useRef<CallLog | null>(null);
     const callDurationRef = useRef(0);
     const doctorRef = useRef<DoctorAccount | null>(null);
+    const startingCallIdRef = useRef<string | null>(null);
+    const isCallerRef = useRef(false);
+
+    const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+    const localVideoRef = useRef<HTMLVideoElement | null>(null);
 
     useEffect(() => { activeCallRef.current = activeCall; }, [activeCall]);
     useEffect(() => { callDurationRef.current = callDuration; }, [callDuration]);
     useEffect(() => { doctorRef.current = doctor; }, [doctor]);
+
+    // Attach & play remote video when stream updates
+    useEffect(() => {
+        const video = remoteVideoRef.current;
+        if (!video || !webrtc.remoteStream) return;
+
+        if (video.srcObject !== webrtc.remoteStream) {
+            video.srcObject = webrtc.remoteStream;
+        }
+
+        const tryPlay = () => {
+            video.play().catch(() => {
+                video.muted = true;
+                video.play().catch(() => {});
+            });
+        };
+
+        tryPlay();
+        video.onloadedmetadata = () => { tryPlay(); };
+    }, [webrtc.remoteStream]);
+
+    // Attach & play local video when stream updates
+    useEffect(() => {
+        const video = localVideoRef.current;
+        if (!video || !webrtc.localStream) return;
+
+        if (video.srcObject !== webrtc.localStream) {
+            video.srcObject = webrtc.localStream;
+        }
+        video.muted = true;
+        video.play().catch(() => {});
+        video.onloadedmetadata = () => { video.play().catch(() => {}); };
+    }, [webrtc.localStream]);
 
     useEffect(() => {
         const doc = getCurrentDoctor();
@@ -75,49 +113,60 @@ export default function CallsPage() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [searchParams]);
 
-    // Poll for call status changes from cloud (e.g., user accepting or rejecting)
+    // Poll for call status changes from cloud (outgoing AND incoming)
     useEffect(() => {
-        if (!activeCall) return;
+        if (!doctor?.id) return;
         const interval = setInterval(async () => {
-            const call = activeCallRef.current;
-            if (!call) return;
-            // Re-read the call status from cloud
-            const updatedCall = await cloudGetActiveCall();
-            if (updatedCall && updatedCall.id === call.id) {
-                if (updatedCall.status !== call.status) {
-                    if (updatedCall.status === 'ongoing') {
-                        setActiveCall({ ...updatedCall });
-                    } else if (updatedCall.status === 'missed' || updatedCall.status === 'completed') {
-                        webrtc.stopCall();
-                        setLastEndedCall(call);
-                        setLastCallDuration(callDurationRef.current);
-                        setActiveCall(null);
-                        setCallDuration(0);
-                        setShowDialer(false);
-                        if (doctorRef.current) {
-                            const h = await cloudGetCallLogs(doctorRef.current.id, 'doctor');
-                            setCallHistory(h);
-                        }
-                        if (updatedCall.status !== 'missed') {
-                            setShowPrescriptionModal(true);
+            const call = await cloudGetActiveCall();
+            const current = activeCallRef.current;
+
+            if (current) {
+                if (call && call.id === current.id) {
+                    if (call.status !== current.status) {
+                        if (call.status === 'ongoing') {
+                            setActiveCall({ ...call });
+                        } else if (call.status === 'missed' || call.status === 'completed') {
+                            startingCallIdRef.current = null;
+                            isCallerRef.current = false;
+                            webrtc.stopCall();
+                            setLastEndedCall(current);
+                            setLastCallDuration(callDurationRef.current);
+                            setActiveCall(null);
+                            setCallDuration(0);
+                            setShowDialer(false);
+                            if (doctorRef.current) {
+                                const h = await cloudGetCallLogs(doctorRef.current.id, 'doctor');
+                                setCallHistory(h);
+                            }
+                            if (call.status !== 'missed') {
+                                setShowPrescriptionModal(true);
+                            }
                         }
                     }
+                } else if (!call) {
+                    startingCallIdRef.current = null;
+                    isCallerRef.current = false;
+                    webrtc.stopCall();
+                    setLastEndedCall(current);
+                    setActiveCall(null);
+                    setCallDuration(0);
+                    setShowDialer(false);
+                    if (doctorRef.current) {
+                        const h = await cloudGetCallLogs(doctorRef.current.id, 'doctor');
+                        setCallHistory(h);
+                    }
                 }
-            } else if (!updatedCall && call.status === 'ringing') {
-                // User may have rejected (status changed to missed, no longer active)
-                webrtc.stopCall();
-                setLastEndedCall(call);
-                setActiveCall(null);
-                setCallDuration(0);
-                setShowDialer(false);
-                if (doctorRef.current) {
-                    const h = await cloudGetCallLogs(doctorRef.current.id, 'doctor');
-                    setCallHistory(h);
+            } else {
+                // Incoming call from patient
+                if (call && call.doctorId === doctor.id && call.status === 'ringing') {
+                    setActiveCall(call);
+                    setCallType(call.type || 'audio');
+                    setCallDuration(0);
                 }
             }
         }, 1500);
         return () => clearInterval(interval);
-    }, [activeCall?.id]);
+    }, [doctor?.id]);
 
     // Call timer — only count when voice is actually connected
     useEffect(() => {
@@ -134,6 +183,8 @@ export default function CallsPage() {
             userId: selectedPatient, userName: patientName,
             type, status: 'ringing', startTime: new Date().toISOString(),
         };
+        isCallerRef.current = true;
+        startingCallIdRef.current = call.id;
         await cloudAddCallLog(call);
         setActiveCall(call);
         setCallType(type);
@@ -143,6 +194,33 @@ export default function CallsPage() {
             await webrtc.startAsCallerAsync(call.id, type);
         } catch (e) {
             console.error('WebRTC caller setup failed:', e);
+        }
+    };
+
+    const acceptIncomingCall = async () => {
+        if (!activeCall) return;
+        isCallerRef.current = false;
+        startingCallIdRef.current = activeCall.id;
+        await cloudUpdateCallLog(activeCall.id, { status: 'ongoing' });
+        setActiveCall(prev => prev ? { ...prev, status: 'ongoing' } : null);
+        setCallDuration(0);
+        try {
+            await webrtc.startAsCalleeAsync(activeCall.id, activeCall.type || 'audio');
+        } catch (e) {
+            console.error('Doctor startAsCalleeAsync failed:', e);
+        }
+    };
+
+    const rejectIncomingCall = async () => {
+        if (!activeCall) return;
+        startingCallIdRef.current = null;
+        isCallerRef.current = false;
+        webrtc.stopCall();
+        await cloudUpdateCallLog(activeCall.id, { status: 'missed', endTime: new Date().toISOString() });
+        setActiveCall(null);
+        if (doctorRef.current) {
+            const h = await cloudGetCallLogs(doctorRef.current.id, 'doctor');
+            setCallHistory(h);
         }
     };
 
@@ -294,48 +372,36 @@ export default function CallsPage() {
                             playsInline
                         />
 
-                        {/* Remote Video (full screen background) */}
+                        {/* Remote Video (patient's video in video call) */}
                         {callType === 'video' && activeCall.status === 'ongoing' && (
                             <video
-                                ref={el => {
-                                    if (el && webrtc.remoteStream && el.srcObject !== webrtc.remoteStream) {
-                                        el.srcObject = webrtc.remoteStream;
-                                        el.play().catch(() => {
-                                            el.muted = true;
-                                            el.play().catch(() => {});
-                                        });
-                                    }
-                                }}
-                                autoPlay playsInline
+                                ref={remoteVideoRef}
+                                autoPlay
+                                playsInline
                                 style={{
                                     position: 'absolute', inset: 0, width: '100%', height: '100%',
                                     objectFit: 'cover',
-                                    display: (webrtc.remoteStream && webrtc.remoteStream.getVideoTracks().length > 0) ? 'block' : 'none',
+                                    opacity: (webrtc.remoteStream && webrtc.remoteStream.getVideoTracks().length > 0) ? 1 : 0,
+                                    transition: 'opacity 0.4s ease',
+                                    zIndex: 1,
                                 }}
                             />
                         )}
-                        {/* Local Video (small pip) */}
+                        {/* Local Video (doctor's small pip) */}
                         {callType === 'video' && (
                             <video
-                                ref={el => {
-                                    if (el && webrtc.localStream && el.srcObject !== webrtc.localStream) {
-                                        el.srcObject = webrtc.localStream;
-                                        el.play().catch(() => {});
-                                    }
-                                }}
-                                autoPlay playsInline muted
+                                ref={localVideoRef}
+                                autoPlay
+                                playsInline
+                                muted
                                 style={{
                                     position: 'absolute', bottom: 100, right: 20, width: 130, height: 180,
                                     borderRadius: 14, objectFit: 'cover', border: '2px solid rgba(255,255,255,0.4)',
                                     zIndex: 10, background: '#000',
+                                    opacity: (webrtc.localStream && webrtc.localStream.getVideoTracks().length > 0) ? 1 : 0,
                                     display: (webrtc.localStream && webrtc.localStream.getVideoTracks().length > 0) ? 'block' : 'none',
                                 }}
                             />
-                        )}
-                        {callType === 'video' && activeCall.status === 'ongoing' && (!webrtc.remoteStream || webrtc.remoteStream.getVideoTracks().length === 0) && (
-                            <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: 0.1 }}>
-                                <Video size={200} />
-                            </div>
                         )}
 
                         {/* AI Recording Indicator */}
@@ -348,6 +414,7 @@ export default function CallsPage() {
                                     padding: '10px 18px', borderRadius: 12,
                                     background: 'rgba(239, 68, 68, 0.15)', border: '1px solid rgba(239, 68, 68, 0.3)',
                                     display: 'flex', alignItems: 'center', gap: 8,
+                                    zIndex: 2,
                                 }}>
                                 <motion.div
                                     animate={{ opacity: [1, 0.3, 1] }}
@@ -374,8 +441,20 @@ export default function CallsPage() {
                             </>
                         )}
                         <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: 14, zIndex: 2, textShadow: '0 1px 4px rgba(0,0,0,0.8)' }}>
-                            {activeCall.status === 'ringing' ? 'Ringing... waiting for patient to accept' : formatDuration(callDuration)}
+                            {activeCall.status === 'ringing' 
+                                ? (isCallerRef.current ? 'Ringing... waiting for patient to accept' : 'Incoming call from patient...')
+                                : formatDuration(callDuration)}
                         </p>
+                        {activeCall.status === 'ringing' && !isCallerRef.current && (
+                            <div style={{ display: 'flex', gap: 16, zIndex: 10 }}>
+                                <button onClick={rejectIncomingCall} className="btn-secondary" style={{ background: '#EF4444', color: 'white', display: 'flex', alignItems: 'center', gap: 8, padding: '10px 20px' }}>
+                                    <PhoneOff size={16} /> Decline
+                                </button>
+                                <button onClick={acceptIncomingCall} className="btn-primary" style={{ background: '#10B981', color: 'white', display: 'flex', alignItems: 'center', gap: 8, padding: '10px 20px' }}>
+                                    <Phone size={16} /> Accept Call
+                                </button>
+                            </div>
+                        )}
                         {/* Permission error */}
                         {webrtc.permissionError && (
                             <div style={{ padding: '8px 16px', borderRadius: 8, background: 'rgba(239,68,68,0.2)', border: '1px solid rgba(239,68,68,0.3)', color: '#FCA5A5', fontSize: 12, maxWidth: 300, textAlign: 'center', zIndex: 2 }}>
