@@ -78,18 +78,34 @@ export default function CallsPage() {
         }
         video.muted = true;
 
+        const markIfReady = () => {
+            if (video.videoWidth > 0 || video.readyState >= 2) {
+                setRemoteVideoPlaying(true);
+            }
+        };
+
         const tryPlay = () => {
             video.play()
-                .then(() => {
-                    if (video.readyState >= 2) setRemoteVideoPlaying(true);
-                })
+                .then(markIfReady)
                 .catch(() => {});
         };
 
         tryPlay();
         video.onloadedmetadata = tryPlay;
         video.onloadeddata = tryPlay;
-    }, [webrtc.remoteStream, activeCall?.status, callType]);
+        video.oncanplay = tryPlay;
+
+        const checkTimer = setInterval(() => {
+            if (video.videoWidth > 0 && !video.paused) {
+                setRemoteVideoPlaying(true);
+                clearInterval(checkTimer);
+            } else if (video.srcObject) {
+                tryPlay();
+            }
+        }, 500);
+
+        return () => clearInterval(checkTimer);
+    }, [webrtc.remoteStream, webrtc.isConnected, activeCall?.status, callType]);
 
     // Attach & play local video when stream updates or video element mounts
     useEffect(() => {
@@ -214,18 +230,19 @@ export default function CallsPage() {
 
     const acceptIncomingCall = async () => {
         if (!activeCall) return;
+        const callToAccept = activeCall;
         webrtc.unlockAudio();
         isCallerRef.current = false;
-        startingCallIdRef.current = activeCall.id;
+        startingCallIdRef.current = callToAccept.id;
         setRemoteVideoPlaying(false);
-        await cloudUpdateCallLog(activeCall.id, { status: 'ongoing' });
         setActiveCall(prev => prev ? { ...prev, status: 'ongoing' } : null);
         setCallDuration(0);
         try {
-            await webrtc.startAsCalleeAsync(activeCall.id, activeCall.type || 'audio');
+            await webrtc.startAsCalleeAsync(callToAccept.id, callToAccept.type || 'audio');
         } catch (e) {
             console.error('Doctor startAsCalleeAsync failed:', e);
         }
+        await cloudUpdateCallLog(callToAccept.id, { status: 'ongoing' });
     };
 
     const rejectIncomingCall = async () => {
@@ -387,6 +404,9 @@ export default function CallsPage() {
                                 playsInline
                                 muted
                                 onPlaying={() => setRemoteVideoPlaying(true)}
+                                onCanPlay={(e) => { if (e.currentTarget.videoWidth > 0) setRemoteVideoPlaying(true); }}
+                                onLoadedData={(e) => { if (e.currentTarget.videoWidth > 0) setRemoteVideoPlaying(true); }}
+                                onResize={(e) => { if (e.currentTarget.videoWidth > 0) setRemoteVideoPlaying(true); }}
                                 onEmptied={() => setRemoteVideoPlaying(false)}
                                 style={{
                                     position: 'absolute', inset: 0, width: '100%', height: '100%',

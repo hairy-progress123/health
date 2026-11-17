@@ -62,18 +62,35 @@ export default function UserCallsPage() {
         }
         video.muted = true;
 
+        const markIfReady = () => {
+            if (video.videoWidth > 0 || video.readyState >= 2) {
+                setRemoteVideoPlaying(true);
+            }
+        };
+
         const tryPlay = () => {
             video.play()
-                .then(() => {
-                    if (video.readyState >= 2) setRemoteVideoPlaying(true);
-                })
+                .then(markIfReady)
                 .catch(() => {});
         };
 
         tryPlay();
         video.onloadedmetadata = tryPlay;
         video.onloadeddata = tryPlay;
-    }, [webrtc.remoteStream, activeCall?.status, activeCall?.type]);
+        video.oncanplay = tryPlay;
+
+        // Safety retry loop until first decoded video frame renders
+        const checkTimer = setInterval(() => {
+            if (video.videoWidth > 0 && !video.paused) {
+                setRemoteVideoPlaying(true);
+                clearInterval(checkTimer);
+            } else if (video.srcObject) {
+                tryPlay();
+            }
+        }, 500);
+
+        return () => clearInterval(checkTimer);
+    }, [webrtc.remoteStream, webrtc.isConnected, activeCall?.status, activeCall?.type]);
 
     // Attach & play local video when stream updates or video element mounts
     useEffect(() => {
@@ -104,14 +121,25 @@ export default function UserCallsPage() {
                 const call = await cloudGetActiveCall();
                 if (!isMounted) return;
                 if (call && call.userId === userId && (call.status === 'ringing' || call.status === 'ongoing')) {
+                    const acceptedInThisTab = typeof window !== 'undefined' && sessionStorage.getItem('hs_accepted_call') === call.id;
+
+                    // If another browser tab accepted this call, don't hijack WebRTC or show duplicate call screen here
+                    if (call.status === 'ongoing' && !isCallerRef.current && !acceptedInThisTab) {
+                        if (activeCallRef.current?.id === call.id && activeCallRef.current.status === 'ringing') {
+                            setActiveCall(null);
+                        }
+                        return;
+                    }
+
                     setActiveCall(prev => {
                         if (!prev || prev.id !== call.id) return call;
+                        if (prev.status === 'ongoing' && call.status === 'ringing') return prev;
                         if (prev.status !== call.status) return call;
                         return prev;
                     });
 
-                    // Callee auto-start: If call is ongoing and we are the receiver (not caller)
-                    if (call.status === 'ongoing' && !isCallerRef.current) {
+                    // Callee auto-start ONLY for the tab that accepted the call (e.g. via IncomingCallOverlay)
+                    if (call.status === 'ongoing' && !isCallerRef.current && acceptedInThisTab) {
                         if (startingCallIdRef.current !== call.id) {
                             startingCallIdRef.current = call.id;
                             try {
@@ -124,6 +152,7 @@ export default function UserCallsPage() {
                 } else if (activeCallRef.current && call === null) {
                     startingCallIdRef.current = null;
                     isCallerRef.current = false;
+                    try { sessionStorage.removeItem('hs_accepted_call'); } catch { }
                     webrtc.stopCall();
                     setActiveCall(null);
                     setCallDuration(0);
@@ -183,24 +212,29 @@ export default function UserCallsPage() {
     // Accept an incoming call from doctor
     const acceptCall = async () => {
         if (!activeCall) return;
+        const callToAccept = activeCall;
         webrtc.unlockAudio();
         isCallerRef.current = false;
-        startingCallIdRef.current = activeCall.id;
+        startingCallIdRef.current = callToAccept.id;
+        try { sessionStorage.setItem('hs_accepted_call', callToAccept.id); } catch { }
         setRemoteVideoPlaying(false);
-        await cloudUpdateCallLog(activeCall.id, { status: 'ongoing' });
         setActiveCall(prev => prev ? { ...prev, status: 'ongoing' } : null);
         setCallDuration(0);
 
+        // Create and publish WebRTC SDP answer FIRST so this tab always owns the connection
+        // before marking status 'ongoing' in Redis
         try {
-            await webrtc.startAsCalleeAsync(activeCall.id, activeCall.type || 'audio');
+            await webrtc.startAsCalleeAsync(callToAccept.id, callToAccept.type || 'audio');
         } catch (e) {
             console.error('WebRTC callee setup failed:', e);
         }
 
+        await cloudUpdateCallLog(callToAccept.id, { status: 'ongoing' });
+
         await cloudAddNotification({
             id: generateId(), userId, type: 'call',
-            title: `${activeCall.type === 'video' ? 'Video' : 'Audio'} Call Started`,
-            message: `Connected with ${activeCall.doctorName}`,
+            title: `${callToAccept.type === 'video' ? 'Video' : 'Audio'} Call Started`,
+            message: `Connected with ${callToAccept.doctorName}`,
             timestamp: new Date().toISOString(), read: false,
         });
     };
@@ -209,6 +243,7 @@ export default function UserCallsPage() {
         if (!activeCall) return;
         startingCallIdRef.current = null;
         isCallerRef.current = false;
+        try { sessionStorage.removeItem('hs_accepted_call'); } catch { }
         webrtc.stopCall();
         setRemoteVideoPlaying(false);
         await cloudUpdateCallLog(activeCall.id, { status: 'missed', endTime: new Date().toISOString() });
@@ -228,6 +263,7 @@ export default function UserCallsPage() {
         if (!call) return;
         startingCallIdRef.current = null;
         isCallerRef.current = false;
+        try { sessionStorage.removeItem('hs_accepted_call'); } catch { }
         webrtc.stopCall();
         setRemoteVideoPlaying(false);
         await cloudUpdateCallLog(call.id, { status: 'completed', endTime: new Date().toISOString(), duration: callDurationRef.current });
@@ -409,6 +445,9 @@ export default function UserCallsPage() {
                                 playsInline
                                 muted
                                 onPlaying={() => setRemoteVideoPlaying(true)}
+                                onCanPlay={(e) => { if (e.currentTarget.videoWidth > 0) setRemoteVideoPlaying(true); }}
+                                onLoadedData={(e) => { if (e.currentTarget.videoWidth > 0) setRemoteVideoPlaying(true); }}
+                                onResize={(e) => { if (e.currentTarget.videoWidth > 0) setRemoteVideoPlaying(true); }}
                                 onEmptied={() => setRemoteVideoPlaying(false)}
                                 style={{
                                     position: 'absolute', inset: 0, width: '100%', height: '100%',

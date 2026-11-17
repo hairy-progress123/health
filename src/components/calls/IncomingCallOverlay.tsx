@@ -42,6 +42,7 @@ export default function IncomingCallOverlay() {
 
     const acceptCall = async () => {
         if (!activeCall) return;
+        try { sessionStorage.setItem('hs_accepted_call', activeCall.id); } catch { }
         await cloudUpdateCallLog(activeCall.id, { status: 'ongoing' });
         await cloudAddNotification({
             id: generateId(), userId, type: 'call',

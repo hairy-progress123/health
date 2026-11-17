@@ -384,18 +384,33 @@ export function useWebRTC() {
             };
         };
 
+        let postConnectDiagScheduled = false;
+
         const syncConnectionState = () => {
             if (!mountedRef.current) return;
             const cs = pc.connectionState;
             const is = pc.iceConnectionState;
             console.log(`[WebRTC ${role}] state: conn=${cs}, ice=${is}`);
-            setIceStatus(is);
+            setIceStatus(cs && cs !== 'new' ? cs : is);
 
-            if (cs === 'connected' || is === 'connected' || is === 'completed') {
+            // Require full ICE + DTLS connection (connectionState === 'connected') when supported
+            const fullyConnected = cs ? cs === 'connected' : (is === 'connected' || is === 'completed');
+
+            if (fullyConnected) {
                 setIsConnected(true);
-                // Re-trigger audio playback once ICE actually connects
+                // Re-emit remote stream & re-trigger audio playback once DTLS/SRTP is actually flowing
                 if (remoteMediaStreamRef.current) {
-                    playRemoteAudio(remoteMediaStreamRef.current);
+                    const live = new MediaStream(remoteMediaStreamRef.current.getTracks());
+                    setRemoteStream(live);
+                    playRemoteAudio(live);
+                }
+                if (!postConnectDiagScheduled) {
+                    postConnectDiagScheduled = true;
+                    setTimeout(() => {
+                        if (pcRef.current === pc && pc.connectionState !== 'closed') {
+                            logDiagnostics(pc, role, callId);
+                        }
+                    }, 3000);
                 }
             } else if (cs === 'failed' || cs === 'closed' || is === 'failed' || is === 'closed') {
                 setIsConnected(false);
