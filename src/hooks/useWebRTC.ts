@@ -1,52 +1,50 @@
 // WebRTC hook — race-free signaling with separate Redis keys
+// Uses max-bundle so audio & video share one ICE transport (identical to audio calls)
 // TURN credentials fetched from /api/turn with reliable fallback
-// Each signal type has its own key to prevent read-modify-write races
 
 import { useRef, useCallback, useEffect, useState } from 'react';
 import { cloudGet, cloudSet } from '@/lib/shared-store';
 
 // ── ICE Config ──────────────────────────────────────────────
 
-const FALLBACK: RTCConfiguration = {
-    iceServers: [
-        { urls: 'stun:stun.relay.metered.ca:80' },
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        {
-            urls: 'turn:global.relay.metered.ca:80',
-            username: '7322fe19c820841a7a89386a',
-            credential: 'nyS+IbWR3E2QiRTI',
-        },
-        {
-            urls: 'turn:global.relay.metered.ca:80?transport=tcp',
-            username: '7322fe19c820841a7a89386a',
-            credential: 'nyS+IbWR3E2QiRTI',
-        },
-        {
-            urls: 'turn:global.relay.metered.ca:443',
-            username: '7322fe19c820841a7a89386a',
-            credential: 'nyS+IbWR3E2QiRTI',
-        },
-        {
-            urls: 'turns:global.relay.metered.ca:443?transport=tcp',
-            username: '7322fe19c820841a7a89386a',
-            credential: 'nyS+IbWR3E2QiRTI',
-        },
-    ],
-    iceCandidatePoolSize: 10,
-};
+const FALLBACK_ICE_SERVERS: RTCIceServer[] = [
+    { urls: 'stun:stun.relay.metered.ca:80' },
+    { urls: 'stun:stun.l.google.com:19302' },
+    {
+        urls: 'turn:global.relay.metered.ca:80',
+        username: '7322fe19c820841a7a89386a',
+        credential: 'nyS+IbWR3E2QiRTI',
+    },
+    {
+        urls: 'turn:global.relay.metered.ca:443',
+        username: '7322fe19c820841a7a89386a',
+        credential: 'nyS+IbWR3E2QiRTI',
+    },
+    {
+        urls: 'turns:global.relay.metered.ca:443?transport=tcp',
+        username: '7322fe19c820841a7a89386a',
+        credential: 'nyS+IbWR3E2QiRTI',
+    },
+];
 
 async function getIceConfig(): Promise<RTCConfiguration> {
+    let iceServers = FALLBACK_ICE_SERVERS;
     try {
         const r = await fetch('/api/turn', { cache: 'no-store' });
         if (r.ok) {
             const d = await r.json();
             if (d.iceServers && d.iceServers.length > 0) {
-                return { iceServers: d.iceServers, iceCandidatePoolSize: 10 };
+                iceServers = d.iceServers;
             }
         }
-    } catch { /* fallback */ }
-    return FALLBACK;
+    } catch { /* use fallback */ }
+
+    return {
+        iceServers,
+        // Force audio and video onto a single bundled ICE/DTLS transport (same as audio-only calls)
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require',
+    };
 }
 
 // ── Signaling types & keys ───────────────────────────────────
@@ -59,6 +57,7 @@ const KEY = {
     answer: (id: string) => `rtc_answer_${id}`,
     callerIce: (id: string) => `rtc_cice_${id}`,
     calleeIce: (id: string) => `rtc_eice_${id}`,
+    diag: (role: string, id: string) => `rtc_diag_${role}_${id}`,
 };
 
 async function sigSet(key: string, val: unknown) {
@@ -72,23 +71,28 @@ async function sigGet<T>(key: string): Promise<T | null> {
 
 async function getMedia(type: 'audio' | 'video'): Promise<MediaStream> {
     if (type === 'video') {
-        // 1. Try with user-facing constraints
+        // 1. Try moderate resolution for smooth TURN relay streaming
         try {
             return await navigator.mediaDevices.getUserMedia({
                 audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-                video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+                video: {
+                    width: { ideal: 480, max: 640 },
+                    height: { ideal: 360, max: 480 },
+                    frameRate: { ideal: 20, max: 24 },
+                    facingMode: 'user',
+                },
             });
         } catch (e1) {
-            console.warn('[WebRTC] getMedia with video constraints failed, trying basic video: true', e1);
-            // 2. Try with basic video: true (bypasses device-specific constraint issues)
+            console.warn('[WebRTC] Ideal video constraints failed, trying basic video: true', e1);
+            // 2. Fallback to basic video: true
             try {
                 return await navigator.mediaDevices.getUserMedia({
                     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
                     video: true,
                 });
             } catch (e2) {
-                console.warn('[WebRTC] Camera unavailable or in use by another tab/app, falling back to audio-only stream', e2);
-                // 3. Fallback to audio-only stream so call connects and can still receive remote video
+                console.warn('[WebRTC] Camera unavailable or locked, falling back to audio-only', e2);
+                // 3. Fallback to audio-only so call still connects & receives remote video
                 try {
                     return await navigator.mediaDevices.getUserMedia({
                         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -104,7 +108,6 @@ async function getMedia(type: 'audio' | 'video'): Promise<MediaStream> {
             }
         }
     } else {
-        // Audio only
         try {
             return await navigator.mediaDevices.getUserMedia({
                 audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -120,6 +123,91 @@ async function getMedia(type: 'audio' | 'video'): Promise<MediaStream> {
     }
 }
 
+// ── Diagnostics helper ───────────────────────────────────────
+
+async function logDiagnostics(pc: RTCPeerConnection, role: string, callId: string) {
+    try {
+        const stats = await pc.getStats();
+        let audioBytesRecv = 0;
+        let videoBytesRecv = 0;
+        let audioBytesSent = 0;
+        let videoBytesSent = 0;
+        let framesDecoded = 0;
+        let framesEncoded = 0;
+        let selectedPair: {
+            state?: string;
+            localId?: string;
+            remoteId?: string;
+            bytesSent?: number;
+            bytesReceived?: number;
+        } | null = null;
+        const candidates = new Map<string, Record<string, unknown>>();
+
+        stats.forEach((report) => {
+            if (report.type === 'local-candidate' || report.type === 'remote-candidate') {
+                candidates.set(report.id, {
+                    type: report.candidateType,
+                    protocol: report.protocol,
+                    address: report.address || report.ip,
+                    port: report.port,
+                });
+            }
+            if (report.type === 'inbound-rtp') {
+                if (report.kind === 'audio') audioBytesRecv = report.bytesReceived || 0;
+                if (report.kind === 'video') {
+                    videoBytesRecv = report.bytesReceived || 0;
+                    framesDecoded = report.framesDecoded || 0;
+                }
+            }
+            if (report.type === 'outbound-rtp') {
+                if (report.kind === 'audio') audioBytesSent = report.bytesSent || 0;
+                if (report.kind === 'video') {
+                    videoBytesSent = report.bytesSent || 0;
+                    framesEncoded = report.framesEncoded || 0;
+                }
+            }
+            if (report.type === 'candidate-pair' && (report.selected || report.nominated)) {
+                selectedPair = {
+                    state: report.state,
+                    localId: report.localCandidateId,
+                    remoteId: report.remoteCandidateId,
+                    bytesSent: report.bytesSent,
+                    bytesReceived: report.bytesReceived,
+                };
+            }
+        });
+
+        const pair = selectedPair as {
+            state?: string;
+            localId?: string;
+            remoteId?: string;
+            bytesSent?: number;
+            bytesReceived?: number;
+        } | null;
+
+        const diag = {
+            ts: new Date().toISOString(),
+            iceConnectionState: pc.iceConnectionState,
+            connectionState: pc.connectionState,
+            signalingState: pc.signalingState,
+            iceGatheringState: pc.iceGatheringState,
+            audioBytesRecv,
+            videoBytesRecv,
+            audioBytesSent,
+            videoBytesSent,
+            framesDecoded,
+            framesEncoded,
+            selectedPair: pair ? {
+                ...pair,
+                local: pair.localId ? candidates.get(pair.localId) : null,
+                remote: pair.remoteId ? candidates.get(pair.remoteId) : null,
+            } : null,
+        };
+        console.log(`[WebRTC Diag ${role}]`, diag);
+        await sigSet(KEY.diag(role, callId), diag);
+    } catch { /* ignore */ }
+}
+
 // ── Hook ────────────────────────────────────────────────────
 
 export function useWebRTC() {
@@ -127,6 +215,7 @@ export function useWebRTC() {
     const localStreamRef = useRef<MediaStream | null>(null);
     const remoteMediaStreamRef = useRef<MediaStream | null>(null);
     const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    const diagTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const mountedRef = useRef(true);
     const audioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -137,41 +226,94 @@ export function useWebRTC() {
     const [localStream, setLocalStream] = useState<MediaStream | null>(null);
     const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
     const [isConnected, setIsConnected] = useState(false);
+    const [iceStatus, setIceStatus] = useState<string>('new');
+    const [audioBlocked, setAudioBlocked] = useState(false);
     const [permissionError, setPermissionError] = useState<string | null>(null);
 
-    // ── Dedicated audio element for playing remote audio ──
-    useEffect(() => {
-        if (!remoteStream || remoteStream.getAudioTracks().length === 0) return;
+    const ensureAudioEl = useCallback(() => {
         if (!audioRef.current) {
             const a = document.createElement('audio');
             a.autoplay = true;
             a.setAttribute('playsinline', '');
-            a.style.cssText = 'position:fixed;top:-9999px;left:-9999px;';
+            a.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;';
             document.body.appendChild(a);
             audioRef.current = a;
         }
-        audioRef.current.srcObject = remoteStream;
-        audioRef.current.play().catch(() => {
-            setTimeout(() => audioRef.current?.play().catch(() => { }), 500);
-        });
-    }, [remoteStream]);
+        return audioRef.current;
+    }, []);
+
+    // ── Single dedicated audio element for remote audio tracks ──
+    const playRemoteAudio = useCallback((stream: MediaStream | null) => {
+        if (!stream) return;
+        const audioTracks = stream.getAudioTracks();
+        if (audioTracks.length === 0) return;
+
+        const a = ensureAudioEl();
+
+        // Attach audio-only MediaStream so audio playback never conflicts with <video>
+        const audioOnlyStream = new MediaStream(audioTracks);
+        a.srcObject = audioOnlyStream;
+        a.muted = false;
+        a.volume = 1.0;
+
+        a.play()
+            .then(() => {
+                if (mountedRef.current) setAudioBlocked(false);
+            })
+            .catch((err) => {
+                console.warn('[WebRTC] Remote audio autoplay blocked:', err);
+                if (mountedRef.current) setAudioBlocked(true);
+            });
+    }, [ensureAudioEl]);
+
+    const unlockAudio = useCallback(() => {
+        const a = ensureAudioEl();
+        if (remoteMediaStreamRef.current && remoteMediaStreamRef.current.getAudioTracks().length > 0) {
+            playRemoteAudio(remoteMediaStreamRef.current);
+        } else {
+            a.muted = false;
+            a.play().catch(() => {});
+        }
+    }, [ensureAudioEl, playRemoteAudio]);
+
+    useEffect(() => {
+        if (!remoteStream || remoteStream.getAudioTracks().length === 0) return;
+        playRemoteAudio(remoteStream);
+    }, [remoteStream, playRemoteAudio]);
+
+    // Auto-unlock audio on any user interaction if browser blocked autoplay
+    useEffect(() => {
+        if (!audioBlocked) return;
+        const onInteract = () => unlockAudio();
+        window.addEventListener('click', onInteract, { once: true });
+        window.addEventListener('touchstart', onInteract, { once: true });
+        return () => {
+            window.removeEventListener('click', onInteract);
+            window.removeEventListener('touchstart', onInteract);
+        };
+    }, [audioBlocked, unlockAudio]);
 
     useEffect(() => {
         mountedRef.current = true;
         return () => {
             mountedRef.current = false;
-            cleanupAll();
+            cleanupAll(true);
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    const cleanupAll = () => {
+    const cleanupAll = (removeAudioEl = false) => {
         activeCallIdRef.current = null;
         isStartingRef.current = false;
 
         if (pollRef.current) {
             clearInterval(pollRef.current);
             pollRef.current = null;
+        }
+
+        if (diagTimerRef.current) {
+            clearTimeout(diagTimerRef.current);
+            diagTimerRef.current = null;
         }
 
         if (localStreamRef.current) {
@@ -193,9 +335,11 @@ export function useWebRTC() {
             try {
                 audioRef.current.pause();
                 audioRef.current.srcObject = null;
-                audioRef.current.remove();
+                if (removeAudioEl) {
+                    audioRef.current.remove();
+                    audioRef.current = null;
+                }
             } catch { }
-            audioRef.current = null;
         }
     };
 
@@ -204,91 +348,69 @@ export function useWebRTC() {
         setLocalStream(null);
         setRemoteStream(null);
         setIsConnected(false);
+        setIceStatus('new');
+        setAudioBlocked(false);
         setPermissionError(null);
     }, []);
 
-    // ── Shared peer-connection setup ──
-    const setupPC = (config: RTCConfiguration, stream: MediaStream) => {
+    // ── Shared peer-connection creation (tracks added by caller/callee in proper order) ──
+    const createPC = (config: RTCConfiguration, role: 'caller' | 'callee', callId: string) => {
         const pc = new RTCPeerConnection(config);
         pcRef.current = pc;
 
-        // Add local tracks to peer connection
-        stream.getTracks().forEach(t => pc.addTrack(t, stream));
-
-        // Persistent remote media stream container
         const streamContainer = new MediaStream();
         remoteMediaStreamRef.current = streamContainer;
 
         pc.ontrack = (e) => {
-            console.log('[WebRTC] ontrack received:', e.track.kind, e.track.id, e.streams);
+            console.log(`[WebRTC ${role}] ontrack:`, e.track.kind, 'id:', e.track.id, 'muted:', e.track.muted);
             if (!mountedRef.current) return;
 
-            // Mark connected since media is arriving
-            setIsConnected(true);
-
-            // If browser passed an active MediaStream in e.streams[0], adopt it directly
-            if (e.streams && e.streams[0]) {
-                const liveStream = e.streams[0];
-                remoteMediaStreamRef.current = liveStream;
-                setRemoteStream(liveStream);
-
-                liveStream.onaddtrack = () => {
-                    if (mountedRef.current) {
-                        setRemoteStream(new MediaStream(liveStream.getTracks()));
-                    }
-                };
-            } else {
-                if (!streamContainer.getTracks().some(t => t.id === e.track.id)) {
-                    streamContainer.addTrack(e.track);
-                }
-                const newStream = new MediaStream(streamContainer.getTracks());
-                remoteMediaStreamRef.current = newStream;
-                setRemoteStream(newStream);
+            if (!streamContainer.getTracks().some(t => t.id === e.track.id)) {
+                streamContainer.addTrack(e.track);
             }
 
-            if (e.track.kind === 'audio' && audioRef.current) {
-                audioRef.current.srcObject = remoteMediaStreamRef.current;
-                audioRef.current.play().catch(err => console.log('Audio autoplay blocked:', err));
-            }
+            // Always emit a new MediaStream instance so React reliably re-renders
+            setRemoteStream(new MediaStream(streamContainer.getTracks()));
 
             e.track.onunmute = () => {
-                console.log('[WebRTC] track onunmute:', e.track.kind);
-                if (mountedRef.current && remoteMediaStreamRef.current) {
-                    setRemoteStream(new MediaStream(remoteMediaStreamRef.current.getTracks()));
-                    if (e.track.kind === 'audio' && audioRef.current) {
-                        audioRef.current.play().catch(() => { });
+                console.log(`[WebRTC ${role}] track unmuted:`, e.track.kind);
+                if (mountedRef.current) {
+                    const updated = new MediaStream(streamContainer.getTracks());
+                    setRemoteStream(updated);
+                    if (e.track.kind === 'audio') {
+                        playRemoteAudio(updated);
                     }
                 }
             };
         };
 
-        pc.onconnectionstatechange = () => {
-            const s = pc.connectionState;
-            console.log('[WebRTC] connectionState:', s, 'iceState:', pc.iceConnectionState);
-            if (mountedRef.current) {
-                if (s === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-                    setIsConnected(true);
-                } else if (s === 'failed' || s === 'closed') {
-                    setIsConnected(false);
+        const syncConnectionState = () => {
+            if (!mountedRef.current) return;
+            const cs = pc.connectionState;
+            const is = pc.iceConnectionState;
+            console.log(`[WebRTC ${role}] state: conn=${cs}, ice=${is}`);
+            setIceStatus(is);
+
+            if (cs === 'connected' || is === 'connected' || is === 'completed') {
+                setIsConnected(true);
+                // Re-trigger audio playback once ICE actually connects
+                if (remoteMediaStreamRef.current) {
+                    playRemoteAudio(remoteMediaStreamRef.current);
                 }
-            }
-            if (s === 'failed') {
-                console.warn('[WebRTC] Connection failed, attempting ICE restart');
-                try { pc.restartIce(); } catch { }
+            } else if (cs === 'failed' || cs === 'closed' || is === 'failed' || is === 'closed') {
+                setIsConnected(false);
             }
         };
 
-        pc.oniceconnectionstatechange = () => {
-            const s = pc.iceConnectionState;
-            console.log('[WebRTC] iceConnectionState:', s);
-            if (mountedRef.current) {
-                if (s === 'connected' || s === 'completed' || pc.connectionState === 'connected') {
-                    setIsConnected(true);
-                } else if (s === 'failed') {
-                    setIsConnected(false);
-                }
+        pc.onconnectionstatechange = syncConnectionState;
+        pc.oniceconnectionstatechange = syncConnectionState;
+
+        // Capture diagnostics 8s into call for visibility
+        diagTimerRef.current = setTimeout(() => {
+            if (pcRef.current === pc && pc.connectionState !== 'closed') {
+                logDiagnostics(pc, role, callId);
             }
-        };
+        }, 8000);
 
         return pc;
     };
@@ -316,7 +438,7 @@ export function useWebRTC() {
             }
         };
 
-        const scheduleFlush = (delay = 200) => {
+        const scheduleFlush = (delay = 150) => {
             if (flushTimer) clearTimeout(flushTimer);
             flushTimer = setTimeout(() => {
                 flushTimer = null;
@@ -331,7 +453,7 @@ export function useWebRTC() {
         return {
             push: (c: RTCIceCandidate) => {
                 allCandidates.push({ candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex });
-                scheduleFlush(200);
+                scheduleFlush(150);
             },
             flush: () => {
                 if (flushTimer) clearTimeout(flushTimer);
@@ -343,7 +465,6 @@ export function useWebRTC() {
     // ── Safe ICE Candidate Applicator ──
     const applyIceCandidates = async (pc: RTCPeerConnection, candidates: IceEntry[], appliedSet: Set<string>) => {
         if (!pc.remoteDescription || !pc.localDescription) {
-            // Cannot add candidates until signaling state is stable with both descriptions set
             return;
         }
         for (const c of candidates) {
@@ -352,7 +473,7 @@ export function useWebRTC() {
                 await pc.addIceCandidate(new RTCIceCandidate(c));
                 appliedSet.add(c.candidate);
             } catch {
-                // If temporary error, leave unadded so next poll will retry
+                // Ignore transient error and retry next poll if needed
             }
         }
     };
@@ -370,7 +491,6 @@ export function useWebRTC() {
         setPermissionError(null);
 
         try {
-            // Parallel: get media + TURN config
             const [stream, config] = await Promise.all([
                 getMedia(callType).catch((e: Error) => { setPermissionError(e.message); throw e; }),
                 getIceConfig(),
@@ -379,20 +499,16 @@ export function useWebRTC() {
             localStreamRef.current = stream;
             setLocalStream(stream);
 
-            const pc = setupPC(config, stream);
+            const pc = createPC(config, 'caller', callId);
 
-            // In Caller: ensure video transceiver direction is set
-            if (callType === 'video') {
-                const hasVideo = stream.getVideoTracks().length > 0;
-                const existing = pc.getTransceivers().find(t => t.receiver.track.kind === 'video');
-                if (existing) {
-                    existing.direction = 'sendrecv';
-                } else if (!hasVideo) {
-                    pc.addTransceiver('video', { direction: 'recvonly' });
-                }
+            // Caller adds local tracks BEFORE createOffer
+            stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+            // If video call but caller had no camera, add recvonly video transceiver
+            if (callType === 'video' && stream.getVideoTracks().length === 0) {
+                pc.addTransceiver('video', { direction: 'recvonly' });
             }
 
-            // ICE candidate pusher → writes to caller ICE key
             const icePusher = createIcePusher(KEY.callerIce(callId));
             pc.onicecandidate = (e) => {
                 if (e.candidate) {
@@ -402,7 +518,6 @@ export function useWebRTC() {
                 }
             };
 
-            // Create and send offer
             const offer = await pc.createOffer({
                 offerToReceiveAudio: true,
                 offerToReceiveVideo: callType === 'video',
@@ -412,7 +527,6 @@ export function useWebRTC() {
 
             isStartingRef.current = false;
 
-            // Poll for Callee's Answer and Callee ICE candidates
             let answerApplied = false;
             const appliedCalleeIce = new Set<string>();
 
@@ -423,7 +537,6 @@ export function useWebRTC() {
                 }
                 const p = pcRef.current;
 
-                // 1. Check for answer
                 if (!answerApplied) {
                     const ans = await sigGet<SdpEntry>(KEY.answer(callId));
                     if (ans && p.signalingState === 'have-local-offer') {
@@ -437,7 +550,6 @@ export function useWebRTC() {
                     }
                 }
 
-                // 2. Once answer is applied, apply any Callee ICE candidates
                 if (answerApplied && p.remoteDescription && p.localDescription) {
                     const calleeIce = await sigGet<IceEntry[]>(KEY.calleeIce(callId));
                     if (calleeIce && calleeIce.length > 0) {
@@ -450,6 +562,7 @@ export function useWebRTC() {
             isStartingRef.current = false;
             throw e;
         }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [cleanup]);
 
     // ═══════════ CALLEE (Receiver) ═══════════
@@ -465,10 +578,9 @@ export function useWebRTC() {
         setPermissionError(null);
 
         try {
-            // Parallel: fetch offer + get media + TURN config
             const [offerData, stream, config] = await Promise.all([
                 (async () => {
-                    for (let i = 0; i < 10; i++) {
+                    for (let i = 0; i < 15; i++) {
                         const o = await sigGet<SdpEntry>(KEY.offer(callId));
                         if (o) return o;
                         await new Promise(r => setTimeout(r, 400));
@@ -489,9 +601,8 @@ export function useWebRTC() {
             localStreamRef.current = stream;
             setLocalStream(stream);
 
-            const pc = setupPC(config, stream);
+            const pc = createPC(config, 'callee', callId);
 
-            // ICE candidate pusher → writes to callee ICE key
             const icePusher = createIcePusher(KEY.calleeIce(callId));
             pc.onicecandidate = (e) => {
                 if (e.candidate) {
@@ -501,19 +612,22 @@ export function useWebRTC() {
                 }
             };
 
-            // 1. Set remote offer
+            // 1. Set remote offer FIRST (creates Unified Plan transceivers matching offer m-lines)
             await pc.setRemoteDescription(new RTCSessionDescription({
                 type: offerData.type as RTCSdpType,
                 sdp: offerData.sdp,
             }));
 
-            // 2. Configure video transceiver direction
-            if (callType === 'video') {
-                const transceivers = pc.getTransceivers();
-                const videoTransceiver = transceivers.find(t => t.receiver.track.kind === 'video');
-                if (videoTransceiver) {
-                    const hasLocalVideo = stream.getVideoTracks().length > 0;
-                    videoTransceiver.direction = hasLocalVideo ? 'sendrecv' : 'recvonly';
+            // 2. Bind local tracks to the existing transceivers cleanly
+            stream.getTracks().forEach(track => {
+                pc.addTrack(track, stream);
+            });
+
+            // Ensure video transceiver stays recvonly if callee has no camera
+            if (callType === 'video' && stream.getVideoTracks().length === 0) {
+                const videoTr = pc.getTransceivers().find(t => t.receiver.track.kind === 'video');
+                if (videoTr) {
+                    videoTr.direction = 'recvonly';
                 }
             }
 
@@ -525,14 +639,14 @@ export function useWebRTC() {
             isStartingRef.current = false;
             icePusher.flush();
 
-            // 4. Now that BOTH descriptions are set, safely apply any Caller ICE candidates
+            // 4. Safely apply caller ICE candidates now that both descriptions are set
             const appliedCallerIce = new Set<string>();
             const initialCallerIce = await sigGet<IceEntry[]>(KEY.callerIce(callId));
             if (initialCallerIce && initialCallerIce.length > 0) {
                 await applyIceCandidates(pc, initialCallerIce, appliedCallerIce);
             }
 
-            // 5. Poll for additional Caller ICE candidates (500ms interval)
+            // 5. Poll for late caller ICE candidates
             pollRef.current = setInterval(async () => {
                 if (!mountedRef.current || !pcRef.current || pcRef.current.connectionState === 'closed') {
                     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
@@ -549,6 +663,7 @@ export function useWebRTC() {
             isStartingRef.current = false;
             throw e;
         }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [cleanup]);
 
     // ── Controls ──
@@ -564,7 +679,7 @@ export function useWebRTC() {
 
     return {
         startAsCallerAsync, startAsCalleeAsync,
-        toggleMute, toggleCamera, stopCall, cleanup,
-        localStream, remoteStream, isConnected, permissionError,
+        toggleMute, toggleCamera, stopCall, cleanup, unlockAudio,
+        localStream, remoteStream, isConnected, iceStatus, audioBlocked, permissionError,
     };
 }

@@ -4,7 +4,7 @@ import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
     Phone, Video, PhoneOff, PhoneIncoming, Mic, MicOff, Camera, CameraOff, Clock,
-    Monitor, MonitorOff, PhoneCall, PhoneMissed, User, X
+    Monitor, MonitorOff, PhoneCall, PhoneMissed, X, Volume2
 } from 'lucide-react';
 import { getCurrentUser, generateId, type CallLog } from '@/lib/store';
 import { cloudGetCallLogs, cloudGetActiveCall, cloudUpdateCallLog, cloudAddCallLog, cloudAddNotification } from '@/lib/shared-store';
@@ -30,6 +30,7 @@ export default function UserCallsPage() {
     const [callDuration, setCallDuration] = useState(0);
     const [showDialer, setShowDialer] = useState(false);
     const [selectedDoc, setSelectedDoc] = useState('doc1');
+    const [remoteVideoPlaying, setRemoteVideoPlaying] = useState(false);
 
     const activeCallRef = useRef<CallLog | null>(null);
     const callDurationRef = useRef(0);
@@ -44,27 +45,37 @@ export default function UserCallsPage() {
     useEffect(() => { callDurationRef.current = callDuration; }, [callDuration]);
     useEffect(() => { userIdRef.current = userId; }, [userId]);
 
-    // Attach & play remote video when stream updates
+    // Attach & play remote video (video-only stream, muted — audio handled by useWebRTC)
     useEffect(() => {
         const video = remoteVideoRef.current;
-        if (!video || !webrtc.remoteStream) return;
-
-        if (video.srcObject !== webrtc.remoteStream) {
-            video.srcObject = webrtc.remoteStream;
+        const videoTracks = webrtc.remoteStream?.getVideoTracks() || [];
+        if (!video || videoTracks.length === 0) {
+            setRemoteVideoPlaying(false);
+            return;
         }
 
+        const currentTracks = (video.srcObject as MediaStream | null)?.getVideoTracks() || [];
+        const sameTrack = currentTracks.length === videoTracks.length &&
+            currentTracks.every((t, i) => t.id === videoTracks[i].id);
+        if (!sameTrack) {
+            video.srcObject = new MediaStream(videoTracks);
+        }
+        video.muted = true;
+
         const tryPlay = () => {
-            video.play().catch(() => {
-                video.muted = true;
-                video.play().catch(() => {});
-            });
+            video.play()
+                .then(() => {
+                    if (video.readyState >= 2) setRemoteVideoPlaying(true);
+                })
+                .catch(() => {});
         };
 
         tryPlay();
-        video.onloadedmetadata = () => { tryPlay(); };
-    }, [webrtc.remoteStream]);
+        video.onloadedmetadata = tryPlay;
+        video.onloadeddata = tryPlay;
+    }, [webrtc.remoteStream, activeCall?.status, activeCall?.type]);
 
-    // Attach & play local video when stream updates
+    // Attach & play local video when stream updates or video element mounts
     useEffect(() => {
         const video = localVideoRef.current;
         if (!video || !webrtc.localStream) return;
@@ -75,7 +86,7 @@ export default function UserCallsPage() {
         video.muted = true;
         video.play().catch(() => {});
         video.onloadedmetadata = () => { video.play().catch(() => {}); };
-    }, [webrtc.localStream]);
+    }, [webrtc.localStream, activeCall?.status, activeCall?.type]);
 
     useEffect(() => {
         const user = getCurrentUser();
@@ -116,6 +127,7 @@ export default function UserCallsPage() {
                     webrtc.stopCall();
                     setActiveCall(null);
                     setCallDuration(0);
+                    setRemoteVideoPlaying(false);
                     const history = await cloudGetCallLogs(userId, 'user');
                     if (isMounted) setCallHistory(history);
                 }
@@ -139,6 +151,7 @@ export default function UserCallsPage() {
     // Start a call from patient to doctor
     const startCallAsPatient = async (type: 'audio' | 'video') => {
         if (!selectedDoc || !userId) return;
+        webrtc.unlockAudio();
         const doc = DOCTORS.find(d => d.id === selectedDoc) || DOCTORS[0];
         const user = getCurrentUser();
         const call: CallLog = {
@@ -154,6 +167,7 @@ export default function UserCallsPage() {
 
         isCallerRef.current = true;
         startingCallIdRef.current = call.id;
+        setRemoteVideoPlaying(false);
         await cloudAddCallLog(call);
         setActiveCall(call);
         setCallDuration(0);
@@ -169,8 +183,10 @@ export default function UserCallsPage() {
     // Accept an incoming call from doctor
     const acceptCall = async () => {
         if (!activeCall) return;
+        webrtc.unlockAudio();
         isCallerRef.current = false;
         startingCallIdRef.current = activeCall.id;
+        setRemoteVideoPlaying(false);
         await cloudUpdateCallLog(activeCall.id, { status: 'ongoing' });
         setActiveCall(prev => prev ? { ...prev, status: 'ongoing' } : null);
         setCallDuration(0);
@@ -194,6 +210,7 @@ export default function UserCallsPage() {
         startingCallIdRef.current = null;
         isCallerRef.current = false;
         webrtc.stopCall();
+        setRemoteVideoPlaying(false);
         await cloudUpdateCallLog(activeCall.id, { status: 'missed', endTime: new Date().toISOString() });
         await cloudAddNotification({
             id: generateId(), userId, type: 'call',
@@ -212,6 +229,7 @@ export default function UserCallsPage() {
         startingCallIdRef.current = null;
         isCallerRef.current = false;
         webrtc.stopCall();
+        setRemoteVideoPlaying(false);
         await cloudUpdateCallLog(call.id, { status: 'completed', endTime: new Date().toISOString(), duration: callDurationRef.current });
         await cloudAddNotification({
             id: generateId(), userId: userIdRef.current, type: 'call',
@@ -236,7 +254,6 @@ export default function UserCallsPage() {
     const missedCalls = callHistory.filter(c => c.status === 'missed').length;
     const totalDuration = callHistory.reduce((sum, c) => sum + (c.duration || 0), 0);
 
-    const hasRemoteVideo = webrtc.remoteStream && webrtc.remoteStream.getVideoTracks().length > 0;
     const hasLocalVideo = webrtc.localStream && webrtc.localStream.getVideoTracks().length > 0;
 
     return (
@@ -384,28 +401,19 @@ export default function UserCallsPage() {
                             display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 24,
                         }}>
 
-                        {/* Dedicated Audio Element for Remote Audio Playback */}
-                        <audio
-                            ref={el => {
-                                if (el && webrtc.remoteStream && el.srcObject !== webrtc.remoteStream) {
-                                    el.srcObject = webrtc.remoteStream;
-                                    el.play().catch(() => {});
-                                }
-                            }}
-                            autoPlay
-                            playsInline
-                        />
-
-                        {/* Remote Video (doctor's video in video call) */}
+                        {/* Remote Video (muted — audio plays cleanly via useWebRTC's dedicated audio element) */}
                         {activeCall.type === 'video' && (
                             <video
                                 ref={remoteVideoRef}
                                 autoPlay
                                 playsInline
+                                muted
+                                onPlaying={() => setRemoteVideoPlaying(true)}
+                                onEmptied={() => setRemoteVideoPlaying(false)}
                                 style={{
                                     position: 'absolute', inset: 0, width: '100%', height: '100%',
                                     objectFit: 'cover',
-                                    opacity: hasRemoteVideo ? 1 : 0,
+                                    opacity: remoteVideoPlaying ? 1 : 0,
                                     transition: 'opacity 0.4s ease',
                                     zIndex: 1,
                                 }}
@@ -429,8 +437,8 @@ export default function UserCallsPage() {
                             />
                         )}
 
-                        {/* Doctor info & Avatar (shown in Audio call OR while remote video track is not yet active) */}
-                        {(activeCall.type === 'audio' || !hasRemoteVideo) && (
+                        {/* Doctor info & Avatar (shown in Audio call OR until remote video frames actually play) */}
+                        {(activeCall.type === 'audio' || !remoteVideoPlaying) && (
                             <>
                                 <div style={{
                                     width: 100, height: 100, borderRadius: '50%', background: 'var(--gradient-primary)',
@@ -454,12 +462,25 @@ export default function UserCallsPage() {
                             </div>
                         )}
 
+                        {/* Audio autoplay unblock prompt */}
+                        {webrtc.audioBlocked && (
+                            <button onClick={webrtc.unlockAudio} style={{
+                                display: 'flex', alignItems: 'center', gap: 8, zIndex: 10,
+                                padding: '8px 16px', borderRadius: 20, border: '1px solid rgba(14,165,233,0.5)',
+                                background: 'rgba(14,165,233,0.25)', color: 'white', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                            }}>
+                                <Volume2 size={14} /> Tap to Enable Audio
+                            </button>
+                        )}
+
                         {/* Connection status */}
                         {activeCall.status === 'ongoing' && (
                             <div style={{ display: 'flex', alignItems: 'center', gap: 6, zIndex: 2, background: 'rgba(0,0,0,0.5)', padding: '4px 12px', borderRadius: 20 }}>
                                 <div style={{ width: 8, height: 8, borderRadius: '50%', background: webrtc.isConnected ? '#10B981' : '#F59E0B' }} />
                                 <span style={{ color: webrtc.isConnected ? '#10B981' : '#F59E0B', fontSize: 11, fontWeight: 600 }}>
-                                    {webrtc.isConnected ? 'Connected' : 'Connecting...'}
+                                    {webrtc.isConnected
+                                        ? 'Connected'
+                                        : (webrtc.iceStatus && webrtc.iceStatus !== 'new' ? `Connecting (${webrtc.iceStatus})...` : 'Connecting...')}
                                 </span>
                             </div>
                         )}
