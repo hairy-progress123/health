@@ -40,25 +40,45 @@ export default function ReportsPage() {
         setReportsList(getReports());
     }, []);
 
+    const prepareImageDataUrl = (file: File): Promise<string> => {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const rawUrl = e.target?.result as string;
+                const img = new Image();
+                img.onload = () => {
+                    const maxDim = 1600;
+                    let { width, height } = img;
+                    if (width > maxDim || height > maxDim) {
+                        const scale = maxDim / Math.max(width, height);
+                        width = Math.round(width * scale);
+                        height = Math.round(height * scale);
+                    }
+                    const canvas = document.createElement('canvas');
+                    canvas.width = width;
+                    canvas.height = height;
+                    const ctx = canvas.getContext('2d');
+                    if (!ctx) return resolve(rawUrl);
+                    ctx.drawImage(img, 0, 0, width, height);
+                    resolve(canvas.toDataURL('image/jpeg', 0.88));
+                };
+                img.onerror = () => resolve(rawUrl);
+                img.src = rawUrl;
+            };
+            reader.onerror = () => reject(new Error('Failed to read image file'));
+            reader.readAsDataURL(file);
+        });
+    };
+
     const extractTextFromFile = (file: File): Promise<string> => {
         return new Promise((resolve) => {
             const reader = new FileReader();
-            const isImage = file.type.startsWith('image/');
-            if (isImage) {
-                reader.onload = (e) => {
-                    const base64 = e.target?.result as string;
-                    resolve(`[IMAGE_BASE64]${base64.split(',')[1] || base64}[/IMAGE_BASE64]\nFile: ${file.name}\nType: ${file.type}`);
-                };
-                reader.onerror = () => resolve('Error reading image file');
-                reader.readAsDataURL(file);
-            } else {
-                reader.onload = (e) => {
-                    const text = e.target?.result as string;
-                    resolve(text || 'Unable to read file content');
-                };
-                reader.onerror = () => resolve('Error reading file');
-                reader.readAsText(file);
-            }
+            reader.onload = (e) => {
+                const text = e.target?.result as string;
+                resolve(text || 'Unable to read file content');
+            };
+            reader.onerror = () => resolve('Error reading file');
+            reader.readAsText(file);
         });
     };
 
@@ -67,7 +87,9 @@ export default function ReportsPage() {
         setAnalysis(null);
 
         try {
-            const reportText = await extractTextFromFile(file);
+            const isImage = file.type.startsWith('image/');
+            const imageData = isImage ? await prepareImageDataUrl(file) : undefined;
+            const reportText = isImage ? '' : await extractTextFromFile(file);
             const ctx = buildAIContext();
             const contextStr = formatContextForAI(ctx);
 
@@ -76,12 +98,17 @@ export default function ReportsPage() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     reportText,
+                    imageData,
                     fileName: file.name,
                     userContext: contextStr,
                 }),
             });
 
             const data = await res.json();
+
+            if (!res.ok || data.error) {
+                throw new Error(data.error || 'Failed to analyze report');
+            }
 
             if (data.analysis) {
                 const analysisData = data.analysis;
@@ -101,7 +128,7 @@ export default function ReportsPage() {
                     userId: getCurrentUser()?.id || 'unknown',
                     fileName: file.name,
                     uploadDate: new Date().toISOString(),
-                    fileData: reportText.substring(0, 5000),
+                    fileData: isImage ? (analysisData.technicalSummary || file.name).substring(0, 5000) : reportText.substring(0, 5000),
                     aiSummary: analysisData.laymanSummary || '',
                     technicalSummary: analysisData.technicalSummary || '',
                     abnormalities: analysisData.abnormalities || [],

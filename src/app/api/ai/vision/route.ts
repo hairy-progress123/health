@@ -1,6 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-const SAMBANOVA_API_KEY = process.env.SAMBANOVA_API_KEY || 'fbd09331-203a-486d-a5e9-ccaf9edbad9b';
+const GROQ_KEYS = [
+    process.env.GROQ_API_KEY_1 || '',
+    process.env.GROQ_API_KEY_2 || '',
+].filter(Boolean);
+
+function stripThinkTags(text: string): string {
+    return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+}
 
 export async function POST(request: NextRequest) {
     try {
@@ -40,27 +47,32 @@ ${userContext || ''}`;
             messages.push({ role: 'user', content: prompt || 'No image provided.' });
         }
 
-        const response = await fetch('https://api.sambanova.ai/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${SAMBANOVA_API_KEY}`,
-            },
-            body: JSON.stringify({
-                model: 'Llama-4-Maverick-17B-128E-Instruct',
-                messages,
-                max_tokens: 2048,
-                temperature: 0.3,
-            }),
-        });
+        let data: { error?: { message?: string }; choices?: Array<{ message?: { content?: string } }> } | null = null;
+        for (let i = 0; i < GROQ_KEYS.length; i++) {
+            const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${GROQ_KEYS[i]}`,
+                },
+                body: JSON.stringify({
+                    model: 'qwen/qwen3.8-27b',
+                    messages,
+                    max_completion_tokens: 2048,
+                    temperature: 0.3,
+                }),
+            });
 
-        const data = await response.json();
-
-        if (data.error) {
-            throw new Error(data.error.message || 'Vision API error');
+            data = await response.json();
+            if (!data?.error) break;
         }
 
-        const analysisText = data.choices?.[0]?.message?.content || 'I could not analyze this image. Please try again.';
+        if (!data || data.error) {
+            throw new Error(data?.error?.message || 'Vision API error');
+        }
+
+        const rawText = data.choices?.[0]?.message?.content || 'I could not analyze this image. Please try again.';
+        const analysisText = stripThinkTags(rawText);
         return NextResponse.json({ response: analysisText });
     } catch (error) {
         console.error('Vision AI Error:', error);
